@@ -12,14 +12,14 @@ Il progetto è strutturato in tre componenti principali che comunicano tra loro:
     *   Verifica che il pacchetto sia di tipo IPv4, ne estrae gli IP (byte grezzi) e tenta di riservare uno spazio all'interno di una mappa condivisa di tipo `RingBuf`.
     *   Scrive i dati estratti nel buffer, conferma l'invio (submit) allo User Space, e infine restituisce `XDP_PASS` per lasciare che il pacchetto continui il suo normale percorso nel sistema operativo.
 
-*   -   **User Space**
-    *   Scritta in Rust e basata sul runtime asincrono **Tokio**, l'applicazione carica il bytecode eBPF, inietta il codice e lo aggancia all'interfaccia di rete scelta dall'utente.
-    *   *Polling e Architettura ad Attori (Message Passing):* Il task principale si mette in ascolto sul Ring Buffer estraendo ciclicamente i byte grezzi, ne effettua il casting sicuro verso la struttura dati Rust e converte i dati da Network Order (Big Endian) nel formato leggibile (`IpAddr`). Invece di limitarsi a stampare il risultato, il programma adotta un design concorrente inviando i pacchetti intercettati a un Manager Task isolato tramite canali `mpsc` (Multi-Producer Single-Consumer)[cite: 1, 2].
+*   **User Space**
+    *   Scritta in Rust e basata sul runtime asincrono *Tokio*, l'applicazione carica il bytecode eBPF, inietta il codice e lo aggancia all'interfaccia di rete scelta dall'utente.
+    *   *Polling e Message Passing:* Il task principale si mette in ascolto sul Ring Buffer estraendo ciclicamente i byte grezzi, ne effettua il casting sicuro verso la struttura dati Rust e converte i dati da Network Order (Big Endian) nel formato leggibile (`IpAddr`). Invece di limitarsi a stampare il risultato, il programma adotta un design concorrente inviando i pacchetti intercettati a un Manager Task isolato tramite canali `mpsc` (Multi-Producer Single-Consumer)[cite: 1, 2].
     *   *Gestione dello Stato Lockless:* Il Manager Task isola lo stato dell'applicazione (una mappa delle frequenze degli IP). La Task Report sfrutta un canale usa-e-getta (`oneshot`) per interrogare asincronamente il manager e stampare le statistiche aggiornate a schermo.
     *   Imposta anche un file descriptor asincrono (`AsyncFd`) per mettersi in ascolto in background e stampare automaticamente a schermo i log di debug (`info!`) generati direttamente dal Kernel, svuotando il buffer solo quando il sistema operativo segnala dati pronti.
     *   L'applicazione garantisce un'uscita pulita alla pressione di `Ctrl+C`. Sfruttando la macro `tokio::select!`, il programma monitora simultaneamente e senza sprechi di CPU l'estrazione dei pacchetti dal Ring Buffer e l'arrivo del segnale di interruzione `SIGINT` (Ctrl+C), garantendo lo sgancio sicuro del programma dal kernel.
 
-*   -   **Common (Strutture Condivise)**
+*   **Common (Strutture Condivise)**
     *   Un modulo condiviso che definisce la struttura dati `IpPair` contenente due interi a 32 bit (`src` e `dst`), fungendo da formato standard per il payload inviato dal kernel allo user space.
     *   La struttura utilizza l'attributo `#[repr(C)]`. Questo impone al compilatore Rust di allineare la memoria esattamente come farebbe un compilatore C, prevenendo errori critici di lettura durante il passaggio e il casting asincrono dei dati grezzi dal kernel all'user space.
 
