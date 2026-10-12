@@ -29,7 +29,6 @@ enum Command {
         resp_tx: Sender<HashMap<Ipv4Addr,usize>>,
 
     }
-
 }
 
 // Avvolge il main in un "reattore" asincrono gestito da Tokio
@@ -92,7 +91,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Cerca la mappa "IP_EVENTS" e istanzia il gestore per estrarre gli eventi passati dal kernel
     let mut ring_buf = RingBuf::try_from(ebpf.map_mut("IP_EVENTS").unwrap()).expect("Errore nella ricerca della mappa"); 
     
-    println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
+    println!("In ascolto dei pacchetti..... Premi Ctrl + C per uscire");
 
     // 5. CREAZIONE DEL TASK MANAGER (MESSAGE PASSING)
     let (tx, mut rx) = mpsc::channel::<Command>(1000);
@@ -115,7 +114,31 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
-    // 6. CICLO DI LETTURA E INVIO DATI AL MANAGER
+    // 6. RICHIESTA DI REPORT ogni 5 secondi
+        let tx_report = tx.clone();
+        // creazione del task report
+        tokio::spawn(async move {
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let (resp_tx, resp_rx) = oneshot::channel::<HashMap<Ipv4Addr, usize>>();
+                let cmd = GetStats { resp_tx };
+
+                if tx_report.send(cmd).await.is_ok() {
+                    let resp = resp_rx.await.unwrap();
+
+                    let mut resp_vec: Vec<(&Ipv4Addr, &usize)> = resp.iter().collect();
+                    resp_vec.sort_by(|a, b| b.1.cmp(a.1));
+                    println!("STATISTICHE ATTUALI:");
+                    for i in resp_vec {
+                        println!("IP: {} -> {} pacchetti", i.0, i.1);
+                    }
+
+                }
+            } 
+        });
+
+    // 7. CICLO DI LETTURA E INVIO DATI AL MANAGER
     loop {
         // Estrae iterativamente tutti gli eventi in coda nel ring buffer (svuotandolo)
         while let Some(item) = ring_buf.next() { 
@@ -137,30 +160,8 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
 
-        // 7. RICHIESTA DI REPORT ogni 5 secondi
-        let tx_report = tx.clone();
-        tokio::spawn(async move {
-
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                let (resp_tx, resp_rx) = oneshot::channel::<HashMap<Ipv4Addr, usize>>();
-                let cmd = GetStats { resp_tx };
-
-                if tx_report.send(cmd).await.is_ok() {
-                    let resp = resp_rx.await.unwrap();
-
-                    let mut resp_vec: Vec<(&Ipv4Addr, &usize)> = resp.iter().collect();
-                    resp_vec.sort_by(|a, b| b.1.cmp(a.1));
-                    println!("Statistiche attuali:");
-                    for i in resp_vec {
-                        println!("IP: {} -> {} pacchetti", i.0, i.1);
-                    }
-
-                }
-            } 
-        });
-    
-        // 7. ATTESA ASINCRONA INTELLIGENTE
+        
+        // 8. ATTESA ASINCRONA INTELLIGENTE
         // finiti i pkt nel ring buffer si esegue quanto segue
         // tokio::select! mette in competizione due eventi. Il primo che si verifica "vince" e viene eseguito.
         tokio::select! {
