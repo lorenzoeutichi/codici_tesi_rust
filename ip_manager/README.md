@@ -1,4 +1,4 @@
-# ipLogger
+# ipManager
 
 ipLogger è un'applicazione di monitoraggio di rete basata su eBPF (eXpress Data Path - XDP) scritta interamente in Rust utilizzando il framework **Aya**. Il progetto ha lo scopo di intercettare i pacchetti IPv4 in entrata, estrarre l'indirizzo IP sorgente e quello di destinazione, e stamparli a schermo in tempo reale.
 
