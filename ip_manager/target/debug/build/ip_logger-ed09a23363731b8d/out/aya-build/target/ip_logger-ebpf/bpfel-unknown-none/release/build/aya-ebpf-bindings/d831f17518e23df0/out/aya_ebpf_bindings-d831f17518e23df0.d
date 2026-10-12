@@ -1,0 +1,9 @@
+/home/loren/tesi/ip_manager/target/debug/build/ip_logger-ed09a23363731b8d/out/aya-build/target/ip_logger-ebpf/bpfel-unknown-none/release/build/aya-ebpf-bindings/d831f17518e23df0/out/aya_ebpf_bindings-d831f17518e23df0.d: /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/lib.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/bindings.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/helpers.rs
+
+/home/loren/tesi/ip_manager/target/debug/build/ip_logger-ed09a23363731b8d/out/aya-build/target/ip_logger-ebpf/bpfel-unknown-none/release/build/aya-ebpf-bindings/d831f17518e23df0/out/libaya_ebpf_bindings-d831f17518e23df0.rlib: /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/lib.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/bindings.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/helpers.rs
+
+/home/loren/tesi/ip_manager/target/debug/build/ip_logger-ed09a23363731b8d/out/aya-build/target/ip_logger-ebpf/bpfel-unknown-none/release/build/aya-ebpf-bindings/d831f17518e23df0/out/libaya_ebpf_bindings-d831f17518e23df0.rmeta: /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/lib.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/bindings.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/helpers.rs
+
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/lib.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/bindings.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/aya-ebpf-bindings-0.2.0/src/x86_64/helpers.rs:

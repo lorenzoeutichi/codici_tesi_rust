@@ -1,0 +1,5 @@
+cargo:rerun-if-env-changed=AYA_BUILD_SKIP
+cargo:rerun-if-changed=/home/loren/tesi/ip_logger/ip_logger-ebpf
+cargo:warning=   Compiling ip_logger-common v0.1.0 (/home/loren/tesi/ip_logger/ip_logger-common)
+cargo:warning=   Compiling ip_logger-ebpf v0.1.0 (/home/loren/tesi/ip_logger/ip_logger-ebpf)
+cargo:warning=    Finished `release` profile [optimized] target(s) in 3.02s

@@ -1,0 +1,10 @@
+/home/loren/tesi/ip_manager/target/debug/deps/wincode_derive-a774c05571234549.d: /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/lib.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/assert_zero_copy.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/common.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_read.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_write.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/uninit_builder.rs
+
+/home/loren/tesi/ip_manager/target/debug/deps/libwincode_derive-a774c05571234549.so: /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/lib.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/assert_zero_copy.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/common.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_read.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_write.rs /home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/uninit_builder.rs
+
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/lib.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/assert_zero_copy.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/common.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_read.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/schema_write.rs:
+/home/loren/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wincode-derive-0.4.6/src/uninit_builder.rs:

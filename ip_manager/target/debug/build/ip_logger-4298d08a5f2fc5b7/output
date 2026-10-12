@@ -1,0 +1,3 @@
+cargo:rerun-if-env-changed=AYA_BUILD_SKIP
+cargo:rerun-if-changed=/home/loren/tesi/ip_manager/ip_logger-ebpf
+cargo:warning=    Finished `release` profile [optimized] target(s) in 0.14s
