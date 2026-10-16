@@ -42,25 +42,42 @@ fn ptr_at<T> (ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 
 fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
 
-    let ethhdr: *const EthHdr = ptr_at(&ctx, 0)?;
-    match unsafe { (*ethhdr).ether_type()} {
+    info!(&ctx, "pacchetto catturato");
+    //PKT ETHERNET
+    let ethhdr: *const EthHdr = ptr_at(&ctx, 0).map_err(|_| {
+        info!(&ctx, "eth: fuori bounds");
+    })?;
+    match unsafe { (*ethhdr).ether_type() } {
         Ok(EtherType::Ipv4) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => {
+            info!(&ctx, "ethertype non ipv4");
+            return Ok(xdp_action::XDP_PASS);
+        }
     }
-
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN)?;
-    match unsafe {(*ipv4hdr).proto()} {
+    // PKT IP e UDP
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(&ctx, EthHdr::LEN).map_err(|_| {
+        info!(&ctx, "ip: fuori bounds");
+    })?;
+    match unsafe { (*ipv4hdr).proto() } {
         Ok(IpProto::Udp) => {}
-        _ => return Ok(xdp_action::XDP_PASS),
+        _ => {
+            info!(&ctx, "ip proto non udp");
+            return Ok(xdp_action::XDP_PASS);
+        }
     }
-    let ihl = (unsafe { (*ipv4hdr).ihl() } as usize) * 4;
+    let ihl = (unsafe { (*ipv4hdr).ihl() } as usize);
+    info!(&ctx, "ihl bytes = {}", ihl as u32);
     if ihl < Ipv4Hdr::LEN {
+        info!(&ctx, "ihl troppo piccolo");
         return Ok(xdp_action::XDP_PASS);
     }
     let length_eth_ip = EthHdr::LEN + ihl;
-
-    let udphdr: *const UdpHdr = ptr_at(&ctx, length_eth_ip)?;
-    if unsafe {(*udphdr).dst_port() == 2152} {
+    let udphdr: *const UdpHdr = ptr_at(&ctx, length_eth_ip).map_err(|_| {
+        info!(&ctx, "udp: fuori bounds");
+    })?;
+    let dport = unsafe { (*udphdr).dst_port() };
+    info!(&ctx, "udp dport = {}", dport);
+    if dport == 2152 {
         let gtp: *const GtpV1Hdr = ptr_at(&ctx, length_eth_ip + UdpHdr::LEN)?;
         if unsafe { (*gtp).flags & 0xF0 == 0x30 } {
             if let Some(mut entry) = IP_EVENTS.reserve::<GtpPair>(0) {

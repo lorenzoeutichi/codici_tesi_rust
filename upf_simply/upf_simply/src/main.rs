@@ -74,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         while let Some(item) = ring_buf.next() {
+            // println!("Size ricevuta: {}", item.len());
             if item.len() == std::mem::size_of::<GtpPair>() {
                 let event  = unsafe { std::ptr::read_unaligned(item.as_ptr() as *const GtpPair) };
 
