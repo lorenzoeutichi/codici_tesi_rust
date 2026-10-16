@@ -1,56 +1,83 @@
 # upf_simply
 
-## Prerequisites
+Prototipo di data plane per una **UPF 5G** scritto in **Rust** con **eBPF (Aya)**.
+Un programma **XDP** intercetta il traffico GTP-U, ne estrae i campi principali e li inoltra
+allo userspace tramite **RingBuf**. Il progetto nasce come base per simulare
+logiche di QoS della UPF (PDR, QER).
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+> ⚠️ Stato: prototipo / work in progress.
 
-## Build & Run
+## Funzionalità
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+- Parsing in XDP di Ethernet → IPv4 → UDP (porta `2152`) → GTP-U
+- Estrazione di `msg_type` e `TEID` dall'header GTP-U
+- Invio delle coppie al processo userspace tramite `RingBuf` (struct `GtpPair`, definita nel crate `common`)
+- Lettura e stampa degli eventi nello userspace
+- Script di test con Scapy per generare pacchetti GTP-U
 
-```shell
-cargo run --release
+## Architettura
+
+```
+ Scapy ──GTP-U (UDP 2152)──▶ interfaccia (lo)
+                                   │
+                           [ XDP program ]  (upf_simply-ebpf)
+                      Eth → IPv4 → UDP:2152 → GTP-U
+                                   │  GtpPair { msg_type, teid }
+                               [ RingBuf ]
+                                   │
+                          [ userspace loader ]  (upf_simply)
+                             legge e stampa gli eventi
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+## Struttura del repository
 
-## Cross-compiling on macOS
-
-Cross compilation should work on both Intel and Apple Silicon Macs.
-
-```shell
-cargo build --package upf_simply --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"rust-lld\"
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/upf_simply` can be
-copied to a Linux server or VM and run there.
+upf_simply/
+├── upf_simply/        # loader userspace (Aya)
+├── upf_simply-ebpf/   # programma XDP (no_std)
+├── common/            # tipi condivisi (GtpPair)
+├── [scripts/test_gtpu.py]   # generatore di pacchetti Scapy
+└── README.md
+```
 
-## License
+## Requisiti
 
-With the exception of eBPF code, upf_simply is distributed under the terms
-of either the [MIT license] or the [Apache License] (version 2.0), at your
-option.
+- Linux con supporto XDP/eBPF (kernel [≥ 5.8 per RingBuf])
+- Rust stable + nightly (con `rust-src`)
+- `bpf-linker`: `cargo install bpf-linker`
+- Privilegi di root (per caricare il programma XDP)
+- Python 3 + Scapy per i test: `pip install scapy`
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
+## Build ed esecuzione
 
-### eBPF
+# build (programma eBPF + userspace)
+```bash
+cargo build --release
+```
 
-All eBPF code is distributed under either the terms of the
-[GNU General Public License, Version 2] or the [MIT license], at your
-option.
+# esecuzione sul loopback
+```bash
+cargo run --release --iface lo
+```
 
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
+## Test
 
-[Apache license]: LICENSE-APACHE
-[MIT license]: LICENSE-MIT
-[GNU General Public License, Version 2]: LICENSE-GPL2
+In un secondo terminale:
+
+```bash
+sudo python3 scripts/test_gtpu.py
+```
+
+Output atteso nel loader:
+
+```
+[esempio] msg_type=255 teid=0x00000001
+```
+
+## Roadmap
+
+- [ ] Gestione dei PDR (Packet Detection Rules) tramite mappe eBPF
+- [ ] QER: rate limiting / simulazione QoS
+- [ ] Contatori e statistiche per TEID
+- [ ] Test su Raspberry Pi con interfacce reali
+- [ ] [...]
