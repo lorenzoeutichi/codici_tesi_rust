@@ -121,7 +121,6 @@ sudo python3 scripts/test_gtpu.py
 - [x] Parsing GTP-U in XDP ed eventi verso lo userspace via `RingBuf`
 - [x] Gestione dei PDR e dei FAR tramite mappe eBPF
 - [x] Contatori per esito (forward, drop, nessun PDR, nessun FAR)
-- [ ] Contatori e statistiche per TEID
 - [ ] Parsing completo dell'header GTP-U (campi opzionali, PDU Session Container / QFI)
 - [ ] Decapsulazione uplink e incapsulazione downlink
 - [ ] QER: rate limiting / simulazione QoS (token bucket)
