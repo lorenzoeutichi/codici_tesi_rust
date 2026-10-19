@@ -37,7 +37,6 @@ fn ptr_at<T> (ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
         return Err(());
     }
     Ok((start + offset) as *const T)    
-    
 }
 
 fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
@@ -78,6 +77,7 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
     let dport = unsafe { (*udphdr).dst_port() };
     info!(&ctx, "udp dport = {}", dport);
     if dport == 2152 {
+        // PKT GTP
         let gtp: *const GtpV1Hdr = ptr_at(&ctx, length_eth_ip + UdpHdr::LEN)?;
         if unsafe { (*gtp).flags & 0xF0 == 0x30 } {
             if let Some(mut entry) = IP_EVENTS.reserve::<GtpPair>(0) {
