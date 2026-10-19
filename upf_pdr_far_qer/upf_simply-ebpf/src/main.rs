@@ -2,13 +2,12 @@
 #![no_main]
 
 use core::mem;
-use aya_ebpf::{bindings::xdp_action, macros::{map, xdp}, maps::{HashMap, PerCpuArray, RingBuf}, programs::XdpContext};
+use aya_ebpf::{bindings::xdp_action::{self, XDP_PASS}, macros::{map, xdp}, maps::{HashMap, PerCpuArray, RingBuf}, programs::XdpContext};
 use aya_log_ebpf::info;
 use network_types::{eth::{EthHdr, EtherType}, ip::{IpProto, Ipv4Hdr}, udp::UdpHdr};
 use upf_simply_common::{
     Far, GtpPair, Pdr, CNT_DROP_FAR, CNT_FORWARD, CNT_MAX, CNT_NO_FAR, CNT_NO_PDR, FAR_FORWARD,
 };
-
 
 #[repr(C, packed)]
 // struttura necessaria per lavorare con l'header GTP-U
@@ -96,8 +95,42 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
     info!(&ctx, "udp dport = {}", dport);
     if dport == 2152 {
         // PKT GTP
-        let gtp: *const GtpV1Hdr = ptr_at(&ctx, length_eth_ip + UdpHdr::LEN)?;
+        let mut off = length_eth_ip + UdpHdr::LEN ;
+        let gtp: *const GtpV1Hdr = ptr_at(&ctx, off)?;
+
         if unsafe { (*gtp).flags & 0xF0 == 0x30 } {
+
+            off += 8;
+            let mut qfi = 0xFF;
+            if unsafe { (*gtp).flags & 0x07 != 0x00 } {
+                // 4 byte opzionali: seq (2), N-PDU (1), next ext type (1)
+                let opt: [u8; 4] = unsafe { *ptr_at::<[u8; 4]>(&ctx, off)? };
+                off += 4;
+                let mut next_type = if unsafe { (*gtp).flags & 0x04 != 0x00 } { opt[3] } else { 0 };
+                info!(&ctx, "offset: {}, qfi: {} --> next type: {}", off, qfi, next_type);
+                
+                for _ in 0..3 {
+                    if next_type == 0 {
+                        break;
+                    }
+                    let w: [u8; 8] = unsafe { *ptr_at::<[u8; 8]>(&ctx, off)? };
+                    let len = w[0] as usize;
+                    if len == 0 || len > 2 {
+                        return Ok(XDP_PASS);
+                    }
+                    if next_type == 0x85 {
+                        qfi = w[2] & 0x3F;
+                    }
+                    next_type = if len == 1 { w[3] } else { w[7] };
+                    off += len * 4;
+                }           
+                info!(&ctx, "offset: {}, qfi: {} --> next type: {}", off, qfi, next_type);
+                if next_type != 0 {
+                    return Ok(XDP_PASS); // catena più lunga del limite
+                }
+            }
+            info!(&ctx, "offset: {}, qfi: {}", off, qfi);
+
             let teid = unsafe {u32::from_be((*gtp).teid)};
             if let Some(mut entry) = IP_EVENTS.reserve::<GtpPair>(0) {
                 unsafe {
@@ -109,6 +142,7 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
                 entry.submit(0);
                 info!(&ctx, "Message Type e TEID estratto dal pacchetto GTP-U");
             }
+            // controllo PDR/FAR
             if unsafe {(*gtp).msg_type}  != 255 {
                    return Ok(xdp_action::XDP_PASS); 
             }
@@ -135,6 +169,7 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
                     },
                 },
             }
+ 
         }
     }
     Ok(xdp_action::XDP_PASS)
