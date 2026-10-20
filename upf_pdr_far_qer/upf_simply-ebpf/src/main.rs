@@ -92,45 +92,47 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
         info!(&ctx, "udp: fuori bounds");
     })?;
     let dport = unsafe { (*udphdr).dst_port() };
-    info!(&ctx, "udp dport = {}", dport);
+    info!(&ctx, "udp dport = {} => pkt GTP-U", dport);
     if dport == 2152 {
         // PKT GTP
-        let mut off = length_eth_ip + UdpHdr::LEN ;
-        let gtp: *const GtpV1Hdr = ptr_at(&ctx, off)?;
+        info!(&ctx, "=> pkt GTP-U");
+        let mut off_byte = length_eth_ip + UdpHdr::LEN ;
+        let gtp: *const GtpV1Hdr = ptr_at(&ctx, off_byte)?;
 
-        if unsafe { (*gtp).flags & 0xF0 == 0x30 } {
+        if unsafe { (*gtp).flags & 0xF0 == 0x30 } { // PKT GTP v1
 
-            off += 8;
+            off_byte += 8;
             let mut qfi = 0xFF;
-            if unsafe { (*gtp).flags & 0x07 != 0x00 } {
-                // 4 byte opzionali: seq (2), N-PDU (1), next ext type (1)
-                let opt: [u8; 4] = unsafe { *ptr_at::<[u8; 4]>(&ctx, off)? };
-                off += 4;
-                let mut next_type = if unsafe { (*gtp).flags & 0x04 != 0x00 } { opt[3] } else { 0 };
-                info!(&ctx, "offset: {}, qfi: {} --> next type: {}", off, qfi, next_type);
-                
-                for _ in 0..3 {
-                    if next_type == 0 {
-                        break;
+            if unsafe { (*gtp).flags & 0x07 != 0x00 } { // flag E o S o PN attivi
+                // 4 byte opzionali dell'header base GTP-U: seq num (2), N-PDU (1), next ext type (1)
+                off_byte += 4;
+                if unsafe { (*gtp).flags & 0x04 != 0x00 } { // controllo flag E (Extension Header) attivo
+                    let mut pos = off_byte - 1;     // byte "tipo" del primo extension header
+                    for _ in 0..3 {
+                        let w: *const [u8; 4] = ptr_at(&ctx, pos)?; // ext_hdr_type e i primi 3 byte dell'ext_hdr 
+                        let next_ext_hdr_type = unsafe { (*w)[0] };
+                        let (ext_hdr_len, qfi_byte) = unsafe { ((*w)[1] as usize, (*w)[3]) };
+                        if next_ext_hdr_type == 0 {
+                            break;
+                        }
+                        if ext_hdr_len == 0 {
+                            return Ok(XDP_PASS);
+                        }
+                        if next_ext_hdr_type == 0x85 { // PDU Session Container
+                            qfi = qfi_byte & 0x3F; // prendo gli ultimi 6 bit meno significativi
+                        }
+                        pos += ext_hdr_len * 4;
                     }
-                    let w: [u8; 8] = unsafe { *ptr_at::<[u8; 8]>(&ctx, off)? };
-                    let len = w[0] as usize;
-                    if len == 0 || len > 2 {
-                        return Ok(XDP_PASS);
+                    // dopo l'ultimo header letto, il tipo del successivo deve essere 0x00
+                    let w: *const [u8; 2] = ptr_at(&ctx, pos)?;
+                    if unsafe { (*w)[0] } != 0x00 { // catena più lunga del limite
+                        return Ok(XDP_PASS);    
                     }
-                    if next_type == 0x85 {
-                        qfi = w[2] & 0x3F;
-                    }
-                    next_type = if len == 1 { w[3] } else { w[7] };
-                    off += len * 4;
-                }           
-                info!(&ctx, "offset: {}, qfi: {} --> next type: {}", off, qfi, next_type);
-                if next_type != 0 {
-                    return Ok(XDP_PASS); // catena più lunga del limite
-                }
+                    off_byte = pos + 1; // primo byte del payload (utile per decapsulare)
+                }        
             }
-            info!(&ctx, "offset: {}, qfi: {}", off, qfi);
-
+            info!(&ctx, "offset: {}, qfi: {}", off_byte, qfi);
+            
             let teid = unsafe {u32::from_be((*gtp).teid)};
             if let Some(mut entry) = IP_EVENTS.reserve::<GtpPair>(0) {
                 unsafe {
