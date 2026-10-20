@@ -86,16 +86,16 @@ CASI = [
 
     ("len=0 (malformato)",
      gtp_u(0x34, opt(EXT_PDU_SESSION) + b"\x00\x00\x09\x00" + PAYLOAD),
-     "compare solo 'offset: 54 --> next type: 133', poi XDP_PASS: nessun log finale"),
+     "nessun log 'offset: ...': XDP_PASS prima del log (len=0)"),
 
     ("catena troppo lunga: 4 header 0x40 (limite del ciclo = 3)",
      gtp_u(0x34, opt(EXT_UDP_PORT) + ext_riempitivo(EXT_UDP_PORT) * 3
            + ext_riempitivo(0) + PAYLOAD),
-     "dopo 3 giri off=66, next_type=64 (!= 0): da trattare come malformato"),
+     "nessun log 'offset: ...': XDP_PASS, la catena supera il limite di 3 header"),
 
     ("troncato: E acceso ma il pacchetto finisce dopo i primi 8 byte",
      gtp_u(0x34),
-     "nessun log: ptr_at fallisce, XDP_PASS"),
+     "nessun log 'offset: ...': ptr_at fallisce, XDP_PASS"),
 ]
 
 
