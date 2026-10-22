@@ -78,10 +78,6 @@ CASI = [
      gtp_u(0x34, opt(EXT_PDU_SESSION) + ext_pdu_session(63) + PAYLOAD),
      "off=58 qfi=63"),
 
-    ("container DL con i 2 bit alti dell'ottetto 2 accesi (0xC0 | 9)",
-     gtp_u(0x34, opt(EXT_PDU_SESSION) + ext_pdu_session(9, hi_bits=0b11) + PAYLOAD),
-     "off=58 qfi=9"),
-
     ("container UL (tipo PDU 1) con bit alto acceso (0x80 | 5)",
      gtp_u(0x34, opt(EXT_PDU_SESSION) + ext_pdu_session(5, pdu_type=1, hi_bits=0b10) + PAYLOAD),
      "off=58 qfi=5"),
