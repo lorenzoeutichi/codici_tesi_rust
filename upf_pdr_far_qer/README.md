@@ -1,129 +1,170 @@
-# upf_PDR/FAR
+# upf_PDR/FAR_QFI (Prototipo UPF 5G in eBPF/Rust)
 
-Prototipo di data plane per una **UPF 5G** scritto in **Rust** con **eBPF (Aya)**.
-Un programma **XDP** intercetta il traffico GTP-U, ne estrae `msg_type` e `TEID`, cerca il TEID
-nelle regole **PDR/FAR** caricate in mappe eBPF e decide se lasciar passare o scartare il pacchetto.
-Gli eventi arrivano allo userspace tramite **RingBuf**, mentre l'esito di ogni pacchetto viene
-conteggiato in una mappa per-CPU. Il progetto nasce come base per simulare le logiche di QoS
-della UPF (PDR, FAR, QER).
+Prototipo di data plane per una **UPF 5G** (User Plane Function) scritto in **Rust** utilizzando **eBPF (Aya)**.
 
-> ⚠️ Stato: prototipo / work in progress.
+Un programma **XDP** intercetta il traffico GTP-U, ne analizza gli header (inclusi gli Extension Headers per ricavare il **QFI**), estrae il `TEID` e applica le logiche di routing e QoS basate sulle tabelle **PDR** (Packet Detection Rule) e **FAR** (Forwarding Action Rule) caricate in mappe eBPF.
+Gli eventi vengono inviati allo userspace tramite **RingBuf**, mentre le statistiche globali e per singolo flusso QoS vengono tracciate tramite mappe per-CPU ad alte prestazioni.
 
-## Funzionalità
+> ⚠️ **Stato:** Prototipo / Work in Progress. Attualmente implementa il parsing e le regole di filtraggio/inoltro, in preparazione per l'effettiva manipolazione dei pacchetti (decapsulazione/incapsulazione).
 
-- Parsing in XDP di Ethernet → IPv4 → UDP (porta `2152`) → GTP-U v1
-- Estrazione di `msg_type` e `TEID` dall'header GTP-U
-- Invio degli eventi allo userspace tramite `RingBuf` (struct `GtpPair`, definita nel crate `common`)
-- **Tabella PDR** (`PDR_MAP`, chiave TEID) e **tabella FAR** (`FAR_MAP`, chiave `far_id`) in mappe eBPF, popolate dallo userspace prima dell'attach
-- Azioni FAR `FORWARD` (`XDP_PASS`) e `DROP` (`XDP_DROP`)
-- **Contatori per esito** (`PerCpuArray`): forward, drop per FAR, nessun PDR, nessun FAR; stampati ogni 2 secondi e all'uscita
-- Script di test con Scapy per generare pacchetti GTP-U con TEID diversi
+## ✨ Funzionalità Attuali
 
-## Architettura
+* **Parsing XDP Sicuro:** Validazione catena Ethernet → IPv4 → UDP (porta `2152`) → GTP-U v1.
 
-```
- Scapy ──GTP-U (UDP 2152)──▶ interfaccia (lo)
-                                   │
-                           [ XDP program ]  (upf_simply-ebpf)
-                      Eth → IPv4 → UDP:2152 → GTP-U
-                                   │
-                    msg_type = 255 (G-PDU)?  ── no ──▶ XDP_PASS
-                                   │ sì
-                          PDR_MAP[TEID] ── assente ──▶ contatore "nessun PDR", XDP_PASS
-                                   │
-                        FAR_MAP[far_id] ── assente ──▶ contatore "nessun FAR", XDP_PASS
-                                   │
-                              action FAR
-                        ┌──────────┴──────────┐
-                    FORWARD               DROP / altro
-              contatore forward     contatore drop (FAR)
-                   XDP_PASS               XDP_DROP
+* **Gestione Extension Headers:** Decodifica iterativa degli header opzionali GTP-U per l'estrazione del **QFI** (QoS Flow Identifier) direttamente dal *PDU Session Container* (Tipo `0x85`).
 
-            (ogni GTP-U valido) GtpPair { msg_type, teid }
-                                   │
-                               [ RingBuf ]
-                                   │
-                          [ userspace loader ]  (upf_simply)
-              popola PDR/FAR, legge e stampa gli eventi e i contatori
-```
+* **Telemetry in Tempo Reale:** Invio asincrono degli eventi (Msg Type, TEID, QFI) allo userspace tramite `RingBuf` (`GtpPair`).
 
-## Mappe eBPF
+* **Control Plane eBPF:** Lookup ultra-veloce nel kernel space tramite:
 
-| Mappa | Tipo | Chiave | Valore |
-|---|---|---|---|
-| `PDR_MAP` | `HashMap` | TEID (`u32`, host order) | `Pdr { far_id }` |
-| `FAR_MAP` | `HashMap` | `far_id` (`u32`) | `Far { action }` |
-| `COUNTERS` | `PerCpuArray<u64>` | indice del contatore | contatore |
-| `IP_EVENTS` | `RingBuf` (256 KB) | – | `GtpPair { msg_type, teid }` |
-| `QER_MAP` | `HashMap` | `qer_id` | `Qer` (definita, non ancora attiva) |
+  * **Tabella PDR** (`PDR_MAP`, chiave: TEID).
 
-Azioni FAR: `FAR_DROP = 0`, `FAR_FORWARD = 1`; qualsiasi altro valore è trattato come drop.
+  * **Tabella FAR** (`FAR_MAP`, chiave: FAR_ID) per le azioni di `FORWARD` (`XDP_PASS`) o `DROP` (`XDP_DROP`).
 
-Il TEID viene convertito da network order a host order nel kernel (`u32::from_be`): le chiavi di
-`PDR_MAP` e il campo `teid` di `GtpPair` sono quindi già in host order.
+* **Statistiche Dettagliate:**
 
-## Regole caricate all'avvio
+  * Contatori globali (`PerCpuArray`): Pacchetti inoltrati, droppati, o privi di PDR/FAR.
 
-Definite in `main.rs` e inserite prima dell'attach del programma:
+  * Contatori QoS (`QFI_COUNTERS`): Tracciamento del volume di traffico per ogni singolo valore QFI (0-63).
 
-| TEID | PDR → FAR | Azione |
-|---|---|---|
-| `9999` | `far_id = 1` | `FORWARD` |
-| `8888` | `far_id = 2` | `DROP` |
+* **Userspace Manager:** Un loader scritto in Tokio che popola le mappe all'avvio, consuma il RingBuf e stampa report periodici dei contatori. 
 
-Qualsiasi altro TEID non ha un PDR. In questa fase "nessun PDR" e "nessun FAR" fanno `XDP_PASS`
-per non interrompere il traffico durante il debug; in una UPF reale andrebbero scartati.
-
-## Struttura del repository
+## 🏗️ Architettura del Flusso
 
 ```
-upf_simply/
-├── upf_simply/        # loader userspace (Aya, tokio)
-├── upf_simply-ebpf/   # programma XDP (no_std)
-├── common/            # tipi e costanti condivisi (Pdr, Far, Qer, GtpPair, indici contatori)
-├── scripts/test_gtpu.py   # generatore di pacchetti Scapy
-└── README.md
+ Scapy / Simulatore ──GTP-U (UDP 2152)──▶ Interfaccia di rete (es. lo)
+                                                │
+                                        [ Programma XDP ]  (Kernel Space)
+                                Eth → IPv4 → UDP:2152 → GTP-U (+ Ext Headers)
+                                                │
+                                msg_type = 255 (G-PDU)?  ── no ──▶ XDP_PASS
+                                                │ sì
+                                 Estrazione iterativa QFI
+                                                │
+                           PDR_MAP[TEID] ── assente ──▶ Contatore "no PDR", XDP_PASS
+                                                │
+                         FAR_MAP[far_id] ── assente ──▶ Contatore "no FAR", XDP_PASS
+                                                │
+                                       Azione definita dal FAR
+                           ┌──────────────────────┴──────────────────────┐
+                        FORWARD                                 DROP / altro
+                    Contatore forward                       Contatore drop (FAR)
+                       XDP_PASS                                   XDP_DROP
+
+              (Per ogni GTP-U valido) 
+              Generazione GtpPair { msg_type, qfi, teid }
+                                                │
+                                           [ RingBuf ]
+                                                │
+                                   [ Userspace Loader / Manager ]  (Tokio)
+                     Popola PDR/FAR, legge eventi, stampa report contatori
+
 ```
 
-## Requisiti
+## 🗺️ Mappe eBPF
 
-- Linux con supporto XDP/eBPF (kernel ≥ 5.8 per `RingBuf`)
-- Rust stable + nightly (con `rust-src`)
-- `bpf-linker`: `cargo install bpf-linker`
-- Privilegi di root (per caricare il programma XDP)
-- Python 3 + Scapy per i test: `pip install scapy`
+| Nome Mappa | Tipo | Chiave | Valore | Scopo | 
+| ----- | ----- | ----- | ----- | ----- | 
+| `PDR_MAP` | `HashMap` | TEID (`u32`, host order) | `Pdr { far_id }` | Associa un Tunnel a una regola di Forwarding | 
+| `FAR_MAP` | `HashMap` | `far_id` (`u32`) | `Far { action }` | Definisce l'azione (0 = Drop, 1 = Forward) | 
+| `COUNTERS` | `PerCpuArray<u64>` | Indice globale (`u32`) | Numero occorrenze | Statistiche globali lock-free | 
+| `QFI_COUNTERS` | `PerCpuArray<u64>` | Valore QFI (`u32`) | Numero occorrenze | Statistiche divise per flussi QoS | 
+| `IP_EVENTS` | `RingBuf` (256 KB) | – | `GtpPair` | Coda circolare per gli eventi verso lo userspace | 
 
-## Build ed esecuzione
+*(Il TEID estratto dal pacchetto viene convertito tramite `u32::from_be` nel kernel, per cui le chiavi di `PDR_MAP` sono memorizzate in Host Byte Order).*
 
-Build (programma eBPF + userspace):
+## ⚙️ Regole di Test Precaricate
 
-```bash
+Al momento dell'avvio, il loader userspace inietta le seguenti regole di test nelle mappe eBPF:
+
+| TEID in ingresso | PDR Hit | FAR assegnato | Azione risultante | 
+| ----- | ----- | ----- | ----- | 
+| `9999` | Sì | `1` | `FORWARD` (Tracciato nei contatori) | 
+| `8888` | Sì | `2` | `DROP` (Tracciato nei contatori) | 
+| *Qualsiasi altro* | No | \- | `PASS` (Fallback di sicurezza) | 
+
+## 🚀 Requisiti e Setup (Ambiente WSL 2 / Ubuntu)
+
+Per compilare ed eseguire il progetto su Windows Subsystem for Linux (WSL), assicurati di avere i seguenti strumenti installati:
+
+1. **Toolchain Rust:**
+
+   ```
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   rustup default stable
+   rustup toolchain install nightly --component rust-src
+   cargo install bpf-linker
+   
+   ```
+
+2. **Dipendenze di Sistema per eBPF/XDP:**
+
+   ```
+   sudo apt-get update
+   sudo apt-get install -y clang llvm libbpf-dev libc6-dev xdp-tools libxdp-dev linux-headers-generic linux-tools-common
+   
+   ```
+
+3. **Scapy (per i test):**
+
+   ```
+   sudo apt-get install -y python3-scapy
+   
+   ```
+
+*(Nota: Su WSL il file system BPF potrebbe non essere montato di default. Se ricevi errori sulle mappe all'avvio, esegui: `sudo mount -t bpf bpf /sys/fs/bpf/`)*.
+
+## 🛠️ Build ed Esecuzione
+
+### 1. Compilazione (Kernel + Userspace)
+
+Assicurati che il tuo `Cargo.toml` workspace sia configurato correttamente, poi lancia:
+
+```
 cargo build --release
+
 ```
 
-Esecuzione sul loopback (con `sudo -E` per mantenere variabili come `RUST_LOG`):
+### 2. Esecuzione
 
-```bash
-cargo run --release --config 'target."cfg(all())".runner="sudo -E"' -- --iface lo
+Avvia il manager sulla tua interfaccia di loopback (`lo`). Si utilizzerà automaticamente la modalità *SKB (Generic XDP)*, che è compatibile con le limitazioni dei driver virtuali di WSL.
+
+```
+cargo run --release -- --iface lo
+
 ```
 
-## Test
+### 3. Test del traffico
 
-In un secondo terminale, dopo aver avviato il loader:
+In un terminale separato, usa lo script Python con Scapy per generare e inviare pacchetti GTP-U verso l'interfaccia in ascolto:
 
-```bash
-sudo python3 scripts/test_gtpu.py
+```
+sudo python3 scripts/test_gtp_qfi.py
+
 ```
 
+*(Dovresti vedere l'output del parsing nel terminale principale e l'avanzamento dei contatori ogni 5 secondi).*
 
-## Roadmap
+## 🛣️ Roadmap e Prossimi Sviluppi
 
-- [x] Parsing GTP-U in XDP ed eventi verso lo userspace via `RingBuf`
-- [x] Gestione dei PDR e dei FAR tramite mappe eBPF
-- [x] Contatori per esito (forward, drop, nessun PDR, nessun FAR)
-- [ ] Parsing completo dell'header GTP-U (campi opzionali, PDU Session Container / QFI)
-- [ ] Decapsulazione uplink e incapsulazione downlink
-- [ ] QER: rate limiting / simulazione QoS (token bucket)
-- [ ] Modifica delle regole a runtime (verso un agente PFCP minimale)
-- [ ] Test con network namespace e `veth`
-- [ ] Test su Raspberry Pi con interfacce reali
+* \[x\] Parsing base GTP-U in XDP ed eventi verso userspace via `RingBuf`.
+
+* \[x\] Gestione PDR e FAR tramite mappe eBPF.
+
+* \[x\] Contatori di esito per-CPU.
+
+* \[x\] Parsing avanzato GTP-U (Ext. Headers, PDU Session Container, estrazione QFI).
+
+* \[x\] Statistiche basate sui flussi QoS (QFI).
+
+* \[ \] **Decapsulazione e Incapsulazione GTP-U (Prossimo Step):**
+
+  * **Uplink:** Implementare la rimozione dinamica dell'header esterno tramite `bpf_xdp_adjust_head`, re-inoltrando il pacchetto IP interno.
+
+  * **Downlink:** Implementare il percorso inverso (aggiunta dell'header GTP-U) per i pacchetti in ingresso destinati alla UE.
+
+* \[ \] Implementazione logiche QER (QoS Enforcement Rule) per il Rate Limiting.
+
+* \[ \] Integrazione con un control plane (es. PFCP) per modifiche dinamiche a runtime.
+
+* \[ \] Test su Raspberry Pi con interfacce reali
