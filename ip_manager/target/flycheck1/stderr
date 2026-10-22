@@ -1,8 +1,9 @@
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on package cache
-   0.181333873s  INFO prepare_target{force=false package_id=ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf) target="ip_logger"}: cargo::core::compiler::fingerprint: fingerprint error for ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf)/Check { test: false }/TargetInner { name: "ip_logger", doc: true, ..: with_path("/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf/src/main.rs", Edition2024) }
-   0.181386881s  INFO prepare_target{force=false package_id=ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf) target="ip_logger"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/loren/tesi/codici_tesi_rust/ip_manager/target/debug/.fingerprint/ip_logger-ebpf-ec67477624c48f0d/bin-ip_logger`
+    Blocking waiting for file lock on package cache
+   0.413795442s  INFO prepare_target{force=false package_id=ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf) target="ip_logger"}: cargo::core::compiler::fingerprint: fingerprint error for ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf)/Check { test: false }/TargetInner { name: "ip_logger", doc: true, ..: with_path("/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf/src/main.rs", Edition2024) }
+   0.413896966s  INFO prepare_target{force=false package_id=ip_logger-ebpf v0.1.0 (/home/loren/tesi/codici_tesi_rust/ip_manager/ip_logger-ebpf) target="ip_logger"}: cargo::core::compiler::fingerprint:     err: failed to read `/home/loren/tesi/codici_tesi_rust/ip_manager/target/debug/.fingerprint/ip_logger-ebpf-ec67477624c48f0d/bin-ip_logger`
 
 Caused by:
     No such file or directory (os error 2)
