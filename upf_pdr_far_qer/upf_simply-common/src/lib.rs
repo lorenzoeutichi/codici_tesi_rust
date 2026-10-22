@@ -4,9 +4,14 @@
 #[derive(Clone, Copy, Debug)]
 pub struct GtpPair {
     pub msg_type: u8,
+    pub qfi: u8,
+    pub _pad: [u8; 2],
     pub teid: u32,
     
 }
+
+pub const NO_QFI: u8 = 0xFF; // valore per mappare QFI non presente
+pub const N_CONT: u32 = 64;
 
 #[repr(C)] 
 #[derive(Clone, Copy, Debug)]
@@ -44,5 +49,6 @@ pub const CNT_FORWARD: u32 = 0;
 pub const CNT_DROP_FAR: u32 = 1;
 pub const CNT_NO_PDR: u32 = 2;
 pub const CNT_NO_FAR: u32 = 3;
-pub const CNT_MAX: u32 = 4;
+pub const CNT_NO_QFI: u32 = 4;
+pub const CNT_MAX: u32 = 5;
 

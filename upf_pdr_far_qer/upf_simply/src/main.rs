@@ -6,7 +6,7 @@ use log::{warn};
 use tokio::{signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    Far, GtpPair, Pdr, CNT_DROP_FAR, CNT_FORWARD, FAR_DROP, CNT_NO_FAR, CNT_NO_PDR, FAR_FORWARD,
+    CNT_DROP_FAR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr,
 };
 use std::time::Duration;
 
@@ -56,7 +56,12 @@ async fn main() -> anyhow::Result<()> {
 
             let msg = hdr_gtp.msg_type;
             let teid = hdr_gtp.teid;
-            println!("Message Type: {} del TEID: {}", msg, teid);
+            let qfi = hdr_gtp.qfi;
+            if qfi != NO_QFI {
+                println!("Message Type: {} del TEID: {} con QFI: {}", msg, teid, qfi);
+            } else {
+                println!("Message Type: {} del TEID: {}", msg, teid);
+            }
 
         }
     });
@@ -80,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ring_buf = RingBuf::try_from(ebpf.take_map("IP_EVENTS").unwrap()).expect("Errore nella ricerca della mappa"); 
     let counters: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("COUNTERS").unwrap())?;
+    let qfi_counters: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("QFI_COUNTERS").unwrap())?;
     let mut last_print = Instant::now();
     loop {
         while let Some(item) = ring_buf.next() {
@@ -98,14 +104,18 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
-                if last_print.elapsed() >= Duration::from_secs(2) {
+                if last_print.elapsed() >= Duration::from_secs(5) {
+                    println!("---NEW REPORT----");
+                    let _ = print_qfi(&qfi_counters);
                     let _ = print_counters(&counters);
+                    println!("-----------");
                     last_print = tokio::time::Instant::now();
                 }  
             }
         }
     }
     
+    let _ = print_qfi(&qfi_counters);
     let _ = print_counters(&counters);
     Ok(())
 }
@@ -116,11 +126,23 @@ fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()
         (CNT_DROP_FAR, "drop (FAR)"),
         (CNT_NO_PDR, "nessun PDR"),
         (CNT_NO_FAR, "nessun FAR"),
+        (CNT_NO_QFI, "nessuna QFI")
     ];
     for (idx, nome) in voci {
         let per_cpu = c.get(&idx, 0)?; // un valore per CPU
         let totale: u64 = per_cpu.iter().sum();
-        println!("{nome:>12}: {totale}");
+        println!("{nome:>12}: {totale}");   
+    }
+    Ok(())
+}
+
+fn print_qfi(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()> {
+    for idx in 0..64 {
+        let per_cpu = c.get(&idx, 0)?;
+        let totale: u64 = per_cpu.iter().sum();
+        if totale > 0 {
+            println!("QFI: {}: {}", idx, totale)
+        }
     }
     Ok(())
 }
