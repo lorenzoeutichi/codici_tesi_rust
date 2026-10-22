@@ -150,7 +150,7 @@ fn try_upf_simply(ctx: XdpContext) -> Result<u32, ()> {
                     );
                 }
                 entry.submit(0);
-                info!(&ctx, "Message Type e TEID estratto dal pacchetto GTP-U");
+                info!(&ctx, "Message Type, TEID e QFI estratto dal pacchetto GTP-U");
             }
             // contatori PDR/FAR e QFI
             if unsafe {(*gtp).msg_type}  != 255 {
