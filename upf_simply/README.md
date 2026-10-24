@@ -74,10 +74,3 @@ Output atteso nel loader:
 [esempio] msg_type=255 teid=0x00000001
 ```
 
-## Roadmap
-
-- [ ] Gestione dei PDR (Packet Detection Rules) tramite mappe eBPF
-- [ ] QER: rate limiting / simulazione QoS
-- [ ] Contatori e statistiche per TEID
-- [ ] Test su Raspberry Pi con interfacce reali
-- [ ] [...]
