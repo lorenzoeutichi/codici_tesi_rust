@@ -2,7 +2,7 @@ use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::b
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
-    GtpPair, CNT_FORWARD, CNT_DECAP, CNT_NO_QFI, CNT_NO_PDR, CNT_NO_FAR, CNT_DROP_FAR, CNT_ERR, FAR_FORWARD, NO_QFI
+    CNT_DECAP, CNT_DROP_FAR, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
 };
 use crate::{gtp::GtpInfo, maps::{count, count_qfi, FAR_MAP, IP_EVENTS, UL_PDR_MAP}, net::{ptr_at_mut, ptr_at}};
 
@@ -58,9 +58,13 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
 
 #[inline(always)]
 fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32, u32> {
-    let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset)?;
+    let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
+        info!(ctx, "inner ip: fuori bounds");
+        CNT_ERR_INNER_IPV4
+    })?;;
     if unsafe { (*inner_ip).version() } != 4 {
-        return Err(CNT_ERR);
+        info!(ctx, "inner ip: versione non 4");
+        return Err(CNT_ERR_INNER_IPV4);
     }
 
     let delta: i32 = (offset - EthHdr::LEN) as i32; 

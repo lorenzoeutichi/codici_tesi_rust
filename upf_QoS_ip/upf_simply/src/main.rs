@@ -6,7 +6,7 @@ use log::{warn};
 use tokio::{signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer,
+    CNT_DECAP, CNT_DROP_FAR, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer,
 };
 use std::{net::Ipv4Addr, time::Duration};
 
@@ -140,7 +140,8 @@ fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()
         (CNT_NO_QFI, "nessuna QFI"),
         (CNT_DECAP, "pkts decapsulati"),
         (CNT_ENCAP, "pkts incapsulati"),
-        (CNT_ERR, "inner pkt non valido"),
+        (CNT_ERR_INNER_IPV4, "inner pkt not ipv4"),
+        (CNT_ERR, "general pkt errors:"),
         
     ];
     for (idx, nome) in voci {

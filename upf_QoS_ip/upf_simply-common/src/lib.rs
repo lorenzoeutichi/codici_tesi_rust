@@ -61,6 +61,7 @@ pub const CNT_NO_FAR: u32 = 3;
 pub const CNT_NO_QFI: u32 = 4;
 pub const CNT_DECAP: u32 = 5;
 pub const CNT_ENCAP: u32 = 6;
-pub const CNT_ERR: u32 = 7;
-pub const CNT_MAX: u32 = 8;
+pub const CNT_ERR_INNER_IPV4: u32 = 7;
+pub const CNT_ERR: u32 = 8; // racchiude tutti gli errori generici sui pkts
+pub const CNT_MAX: u32 = 9;
 
