@@ -47,12 +47,10 @@ fn try_upf_simply(ctx: &XdpContext) -> Result<u32, u32> {
             info!(ctx, "udp: fuori bounds");
             CNT_ERR
         })?;
-        
         let dport = unsafe { (*udphdr).dst_port() };
-        info!(ctx, "udp dport = {} => pkt GTP-U", dport);
         
         if dport == 2152 {
-            info!(ctx, "=> pkt GTP-U");
+            info!(ctx, "udp dport = {} => pkt GTP-U", dport);
             let gtp_offset = udp_offset + UdpHdr::LEN;
             let gtp_info = gtp::parse_gtp(ctx, gtp_offset)?;
             return uplink::handle(ctx, eth_hdr_copy, gtp_info);

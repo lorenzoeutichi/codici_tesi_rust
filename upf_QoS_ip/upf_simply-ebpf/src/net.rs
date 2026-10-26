@@ -42,7 +42,7 @@ pub fn parse_ipv4(ctx: &XdpContext) -> Result<Ipv4Info, u32> {
     let ihl = unsafe { (*ipv4hdr).ihl() } as usize;
     info!(ctx, "ihl bytes = {}", ihl as u32);
     if ihl < Ipv4Hdr::LEN {
-        info!(&ctx, "ihl troppo piccolo");
+        info!(ctx, "ip hdr troppo piccolo");
         return Err(CNT_ERR);
     }
     

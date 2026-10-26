@@ -101,7 +101,7 @@ In un terminale separato, usa lo script Python con Scapy (scripts/netns_decap_te
 ```bash
 sudo ip netns exec gnb python3 netns_decap_test.py
 ```
-*Potrai osservare l'output asincrono del RingBuffer in tempo reale nel terminale principale e l'avanzamento dei contatori di decapsulazione.*
+*Si può osservare l' output asincrono del RingBuffer in tempo reale nel terminale principale e l'avanzamento dei contatori.*
 
 ## 🛣️ Roadmap e Prossimi Sviluppi
 

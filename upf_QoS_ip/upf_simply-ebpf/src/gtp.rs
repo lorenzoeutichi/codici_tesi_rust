@@ -29,7 +29,7 @@ pub fn parse_gtp(ctx: &XdpContext, start_offset: usize) -> Result<GtpInfo, u32> 
         return Err(CNT_ERR);
     }
     // => PKT GTP-U V1
-    let mut off_byte = start_offset + 8;
+    let mut off_byte = start_offset + 8; // 8 byte: lunghezza minima hdr gtp-u
     let mut qfi = NO_QFI; // valore per mappare assenza QFI
 
     if flags & 0x07 != 0x00 { // flag E o S o PN attivi
@@ -42,12 +42,12 @@ pub fn parse_gtp(ctx: &XdpContext, start_offset: usize) -> Result<GtpInfo, u32> 
                 let next_ext_hdr_type = unsafe { (*w)[0] };
                 let (ext_hdr_len, qfi_byte) = unsafe { ((*w)[1] as usize, (*w)[3]) };
                 
-                if next_ext_hdr_type == 0 { break; }
+                if next_ext_hdr_type == 0 { break; } // = 0: nessun ext hdr successivo
                 if ext_hdr_len == 0 { return Err(CNT_ERR); }
                 if next_ext_hdr_type == 0x85 { // PDU Session Container
-                    qfi = qfi_byte & 0x3F; // prendo gli ultimi 6 bit meno significativi
+                    qfi = qfi_byte & 0x3F; // prendo gli ultimi 6 bit meno significativi (relativi al secondo byte)
                 }
-                pos += ext_hdr_len * 4;
+                pos += ext_hdr_len * 4; // 4 byte: lunghezza dell' ext hdr
             }
             // dopo l'ultimo header letto, il tipo del successivo deve essere 0x00
             let w: *const [u8; 2] = ptr_at(ctx, pos)?;

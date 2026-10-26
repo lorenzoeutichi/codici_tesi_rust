@@ -40,7 +40,7 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
                 FAR_FORWARD => {
                     // decapsulazione
                     if pdr.outer_hdr_removed == 1 {
-                        return decap_ul(&ctx, gtp.payload_offset, eth_hdr_copy)
+                        return decap_ul(ctx, gtp.payload_offset, eth_hdr_copy)
                     }
                     count(CNT_FORWARD);  
                 }
@@ -61,19 +61,18 @@ fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32
     let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
         info!(ctx, "inner ip: fuori bounds");
         CNT_ERR_INNER_IPV4
-    })?;;
+    })?;
     if unsafe { (*inner_ip).version() } != 4 {
         info!(ctx, "inner ip: versione non 4");
         return Err(CNT_ERR_INNER_IPV4);
     }
 
-    let delta: i32 = (offset - EthHdr::LEN) as i32; 
-    
+    let delta: i32 = (offset - EthHdr::LEN) as i32; // byte di pkt da togliere (dall'outer ip al gtp-u)
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta).is_negative() } {
         return Err(CNT_ERR);
     }
     
-    let eth_header_mut: *mut EthHdr = ptr_at_mut(ctx, 0)?; 
+    let eth_header_mut: *mut EthHdr = ptr_at_mut(ctx, 0)?; // in realtà sono 14 byte di GTP-U
     unsafe { *eth_header_mut = eth_hdr_copy; } 
     
     count(CNT_DECAP);
