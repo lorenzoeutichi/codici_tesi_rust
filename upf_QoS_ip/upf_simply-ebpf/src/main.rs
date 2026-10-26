@@ -5,7 +5,7 @@ mod maps;
 mod net;
 mod gtp;
 mod uplink;
-// mod downlink;
+mod downlink;
 
 use aya_ebpf::{bindings::xdp_action::XDP_PASS, macros::xdp, programs::XdpContext};
 use aya_log_ebpf::info;
@@ -42,13 +42,13 @@ fn try_upf_simply(ctx: &XdpContext) -> Result<u32, u32> {
     let ip_info = net::parse_ipv4(ctx)?;
 
     if ip_info.next_proto == IpProto::Udp {
-        let udp_offset = EthHdr::LEN + ip_info.ihl_bytes;
+        let udp_offset = EthHdr::LEN + (ip_info.ihl_bytes & 0xFF);
         let udphdr: *const UdpHdr = ptr_at(ctx, udp_offset).map_err(|_| {
             info!(ctx, "udp: fuori bounds");
             CNT_ERR
         })?;
+
         let dport = unsafe { (*udphdr).dst_port() };
-        
         if dport == 2152 {
             info!(ctx, "udp dport = {} => pkt GTP-U", dport);
             let gtp_offset = udp_offset + UdpHdr::LEN;
@@ -56,8 +56,8 @@ fn try_upf_simply(ctx: &XdpContext) -> Result<u32, u32> {
             return uplink::handle(ctx, eth_hdr_copy, gtp_info);
         }
     }
-    Ok(XDP_PASS)
-    // downlink::handle(ctx, eth_hdr_copy, ip_info)
+
+    return downlink::handle(ctx, eth_hdr_copy, ip_info);
 }
 
 #[cfg(not(test))]
