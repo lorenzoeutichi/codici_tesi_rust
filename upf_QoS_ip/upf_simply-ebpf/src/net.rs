@@ -51,7 +51,7 @@ pub fn parse_ipv4(ctx: &XdpContext) -> Result<Ipv4Info, u32> {
         Err(_) => return Err(CNT_ERR),
     };
     let dst = u32::from_be_bytes(unsafe { (*ipv4hdr).dst_addr });
-    let length_pkt = u16::from_be(unsafe {(*ipv4hdr).tot_len() });
+    let length_pkt = unsafe {(*ipv4hdr).tot_len() }; //già in Network Order
     
     Ok(Ipv4Info {
         ihl_bytes: ihl,
