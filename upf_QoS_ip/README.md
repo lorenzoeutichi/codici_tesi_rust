@@ -16,7 +16,7 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
 
 * **Decapsulazione Uplink:** Rimozione dinamica dell'header esterno GTP-U/UDP/IPv4 tramite `bpf_xdp_adjust_head`, validazione dell'IP interno (con contatore dedicato `CNT_ERR_INNER_IP`) e re-inoltro.
 
-* **Incapsulazione Downlink (Encap + QFI):** Iniezione di 44 byte in testa al pacchetto IP tramite `adjust_head` negativo. Generazione da zero degli header IPv4 (con ricalcolo automatico del checksum), UDP, GTP-U e inserimento dell'Extension Header (PDU Session Container) estrando il QFI dalle mappe.
+* **Incapsulazione Downlink (Encap + QFI):** Iniezione di 44 byte in testa al pacchetto IP tramite `adjust_head` negativo. Generazione da zero degli header IPv4 (con ricalcolo automatico del checksum), UDP, GTP-U e inserimento dell'Extension Header (PDU Session Container) estraendo il QFI dalle mappe.
 
 * **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink) ed emissione dinamica in uscita (Downlink) del container `0x85` per la gestione del **QFI** (QoS Flow Identifier), estrapolato direttamente dal QER.
 
@@ -45,8 +45,8 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
                        │                               │
        FAR_MAP[far_id] ┴─ DROP/FORWARD                 ├─ FAR Action
                        │                               │
-           [ Decapsulazione (adjust_head) ]        [ Incapsulazione ]
-           (Rimozione 36+ byte header ext)       (Aggiunta 44 byte: IP+UDP+GTP+Ext)
+           [ Decapsulazione ]                   [ Incapsulazione ]
+           (Rimozione 36+ byte header ext)      (Aggiunta 44 byte: IP+UDP+GTP+Ext)
                        │                               │
               Invio evento su RingBuf            Calcolo Checksum IPv4
                        │                               │
@@ -88,7 +88,6 @@ Assicurati che il tuo `Cargo.toml` workspace sia configurato (e i profili `panic
 ```
 cargo +nightly xtask build-ebpf
 cargo build --release
-
 ```
 
 ##### 2. Creazione Namespace (Per Test Decap/Encap)
@@ -113,14 +112,12 @@ In terminali separati, usa gli script Python con Scapy per testare decapsulazion
 
 ```
 sudo ip netns exec gnb python3 scripts/netns_decap_test.py
-
 ```
 
 **Test Downlink (Encap):**
 
 ```
 sudo ip netns exec dn python3 scripts/netns_encap_test.py
-
 ```
 
 *(Verifica l'inserimento dell'header tramite: `sudo ip netns exec gnb tcpdump -i veth-gnb -n -vv -X udp port 2152`)*
