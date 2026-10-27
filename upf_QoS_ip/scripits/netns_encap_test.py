@@ -10,7 +10,7 @@ verso l'UPF, che deve incapsularlo in GTP-U e inviarlo su veth-n3 al gNB
 (10.0.3.2) con TEID 7001.
 
 Verifica, in un altro terminale:
-     sudo tcpdump -i veth-n6 -n -vv -e -X
+    sudo ip netns exec ns-gnb tcpdump -i veth-gnb -n -vv -X udp port 2152
 """
 import time
 

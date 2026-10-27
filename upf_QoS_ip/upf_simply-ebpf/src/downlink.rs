@@ -1,8 +1,8 @@
 use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::bpf_xdp_adjust_head, programs::XdpContext};
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, udp::UdpHdr};
-use upf_simply_common::{CNT_DROP_FAR, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, FAR_FORWARD, Far};
-use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, count}, net::{Ipv4Info, ptr_at_mut}};
+use upf_simply_common::{CNT_DROP_FAR, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_FORWARD, Far, NO_QFI};
+use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, count}, net::{Ipv4Info, ptr_at_mut}};
 
 
 
@@ -12,24 +12,34 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
     match unsafe { DL_PDR_MAP.get(&ip.ip_dst)} {
         None => {
             info!(ctx, "nessuna PDR per tale UE ip: {}", ip.ip_dst);
-            count(CNT_NO_FAR);
+            count(CNT_NO_PDR);
             return Ok(XDP_PASS)
         }
-        Some(pdr) => match unsafe {FAR_MAP.get(&pdr.far_id)} {
-            None => return Err(CNT_NO_FAR),
-            Some(far) => match far.action {
-                FAR_FORWARD => {
-                    if far.outer_hdr_creation == 1 {
-                        return encap_dl (ctx, ip.total_length, far, eth_hdr)
+
+        Some(pdr) => {
+            let mut qfi = NO_QFI;
+            match unsafe { QER_MAP.get(&pdr.qer_id)} {
+                None => count(CNT_NO_QFI),
+                Some(qer) => {
+                    qfi = qer.qfi;
+                }
+            }
+            match unsafe {FAR_MAP.get(&pdr.far_id)} {
+                None => return Err(CNT_NO_FAR),
+                Some(far) => match far.action {
+                    FAR_FORWARD => {
+                        if far.outer_hdr_creation == 1 {
+                            return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi)
+                        }
+                        count(CNT_FORWARD);
+
                     }
-                    count(CNT_FORWARD);
+                    _ => {
+                        count(CNT_DROP_FAR);
+                        return Ok(XDP_DROP)
+                    }
 
                 }
-                _ => {
-                    count(CNT_DROP_FAR);
-                    return Ok(XDP_DROP)
-                }
-
             }
         }
     }
@@ -37,8 +47,8 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 }
 
 #[inline(always)]
-fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr) -> Result<u32, u32> {
-    let add_hdr: i32 = 36;    
+fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8) -> Result<u32, u32> {
+    let add_hdr: i32 = 44;  // escluso l'eth hdr (ip + udp + gtp-u + ext hdr)
     info!(ctx, "DL Encap: IP total_length estratta = {}", total_length as u32);
     if total_length + (add_hdr as u16) > 1500 {
         info!(ctx, "MTU standard (1500 byte) superato");
@@ -71,22 +81,35 @@ fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: E
     unsafe {
         (*udp_hdr).set_src_port(2152);
         (*udp_hdr).set_dst_port(2152);
-        (*udp_hdr).set_len(total_length + 16);
+        (*udp_hdr).set_len(total_length + 16 + 8);
         (*udp_hdr).set_checksum(0);
     }
     // aggiunta hdr GTP-U
     let gtp_hdr: *mut GtpV1Hdr = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN)?;
     unsafe {
-        (*gtp_hdr).flags = 0x30;
+        (*gtp_hdr).flags = 0x34; //flag E attivo
         (*gtp_hdr).msg_type = 255;
-        (*gtp_hdr).length = total_length.to_be();
+        (*gtp_hdr).length = (total_length + 8).to_be() ;
         (*gtp_hdr).teid = far.peer_teid.to_be();
+    }
+    // aggiunta ext hdr
+    let ext_hdr: *mut [u8; 8] = ptr_at_mut(ctx, EthHdr::LEN + Ipv4Hdr::LEN + UdpHdr::LEN + 8)?;
+    unsafe {
+        (*ext_hdr)[0] = 0x00; // sequence number
+        (*ext_hdr)[1] = 0x00; // sequence number
+        (*ext_hdr)[2] = 0x00; // N-PDU
+        (*ext_hdr)[3] = 0x85; // next ext hdr type
+        (*ext_hdr)[4] = 0x01; // lunghezza ext hdr
+        (*ext_hdr)[5] = 0x00; // pdu type (0: dl)
+        (*ext_hdr)[6] = qfi & 0x3F; // scrivo il qfi negli ultimi 6 bit
+        (*ext_hdr)[7] = 0x00;
     }
 
     // calcolo dell' ip hdr checksum
     unsafe {(*ip_hdr).set_checksum(checksum_ipv4hdr(ip_hdr)) }; 
     info!(ctx, "pkt ip incapsulato correttamente in un GTP-U");
 
+    count(CNT_FORWARD);
     count(CNT_ENCAP);
     Ok(XDP_PASS)
 }
