@@ -6,7 +6,7 @@ Un programma **XDP** intercetta il traffico, esegue un dispatch rigoroso tra flu
 
 Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tramite `AsyncRingBuf`, mentre le statistiche globali, gli errori specifici e il tracciamento per singolo flusso QoS vengono gestiti tramite mappe per-CPU ad alte prestazioni.
 
-> 🚀 **Stato:** Prototipo Avanzato. Il progetto sfrutta un'architettura modulare per superare i limiti del verifier eBPF. Sono ora pienamente implementate e validate sia la decapsulazione dinamica in Uplink, sia l'incapsulazione in Downlink con l'inserimento dinamico del *PDU Session Container* (QFI).
+> 🚀 **Stato:** Prototipo Avanzato. Il progetto sfrutta un'architettura modulare per superare i limiti del verifier eBPF. Sono ora pienamente implementate e validate sia la decapsulazione dinamica in Uplink, sia l'incapsulazione in Downlink con l'inserimento dinamico del *PDU Session Container* (QFI), ed è stato integrato con successo il sistema di **Rate Limiting bidirezionale basato su algoritmo Token Bucket**.
 
 ## ✨ Funzionalità Attuali
 
@@ -20,15 +20,17 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
 
 * **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink) ed emissione dinamica in uscita (Downlink) del container `0x85` per la gestione del **QFI** (QoS Flow Identifier), estrapolato direttamente dal QER.
 
+* **Rate Limiting (QoS Policing):** Implementazione rigorosa del Rate Limiting bidirezionale (Uplink e Downlink) tramite algoritmo **Token Bucket**. Il controllo della banda applica il Maximum Bit Rate (MBR) definito nella QoS Enforcement Rule (QER), scartando istantaneamente i pacchetti eccedenti (*Hard Drop*) senza superare i limiti matematici del verifier eBPF (utilizzando un moltiplicatore pre-calcolato in user-space con bit-shift `>> 30`). I timestamp di ricarica e i token sono mantenuti separati per i flussi UL e DL per garantire tolleranza ai micro-burst.
+
 * **Telemetry Asincrona in Tempo Reale:** Invio zero-latenza degli eventi (Msg Type, TEID, QFI) allo userspace tramite `AsyncRingBuf` (`GtpPair`), integrato nel runtime Tokio senza cicli di polling bloccanti.
 
 * **Control Plane eBPF:** Lookup ultra-veloce nel kernel space tramite `PDR_MAP`, `DL_PDR_MAP`, `FAR_MAP` e `QER_MAP`.
 
-* **Statistiche Dettagliate:** Contatori globali e per-CPU (inclusi drop, forward, decap, encap ed errori) e tracciamento del volume di traffico per ogni singolo valore QFI (0-63).
+* **Statistiche Dettagliate:** Contatori globali e per-CPU (inclusi drop, forward, decap, encap, QoS drop ed errori) e tracciamento del volume di traffico per ogni singolo valore QFI (0-63).
 
 ## 🏗️ Architettura del Flusso
 
-```
+```text
  Scapy / RAN ──Traffico (GTP/IP)──▶ Interfaccia di rete (es. veth)
                                         │
                     [ Programma XDP - Dispatcher (main.rs) ]
@@ -45,13 +47,15 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
                        │                               │
        FAR_MAP[far_id] ┴─ DROP/FORWARD                 ├─ FAR Action
                        │                               │
+            [ Rate Limiting (QoS) ]             [ Rate Limiting (QoS) ]
+           (Verifica Token Bucket UL)          (Verifica Token Bucket DL)
+                       │                               │
            [ Decapsulazione ]                   [ Incapsulazione ]
            (Rimozione 36+ byte header ext)      (Aggiunta 44 byte: IP+UDP+GTP+Ext)
                        │                               │
               Invio evento su RingBuf            Calcolo Checksum IPv4
                        │                               │
                    XDP_PASS                        XDP_PASS
-
 ```
 
 #### 🗺️ Mappe eBPF
@@ -61,8 +65,9 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
 | `PDR_MAP` | `HashMap` | TEID (`u32`, host order) | `Pdr { far_id, qer_id... }` | Regole Forwarding Uplink | 
 | `DL_PDR_MAP` | `HashMap` | IP UE (`u32`, host order) | `Pdr { far_id, qer_id... }` | Regole Forwarding Downlink (Routing IP) | 
 | `FAR_MAP` | `HashMap` | `far_id` (`u32`) | `Far { action, ips... }` | Definisce l'azione e i parametri di tunnel | 
-| `QER_MAP` | `HashMap` | `qer_id` (`u32`) | `Qer { qfi, mbr...}` | QoS Enforcement Rules (QFI mapping) | 
-| `COUNTERS` | `PerCpuArray<u64>` | Indice globale (`u32`) | Numero occorrenze | Statistiche globali (Forward, Drop, Decap, Encap, Errori) | 
+| `QER_MAP` | `HashMap` | `qer_id` (`u32`) | `Qer { qfi, mbr...}` | QoS Enforcement Rules (QFI mapping e MBR config) | 
+| `QER_STATE_MAP` | `HashMap` | `qer_id` (`u32`) | `QerState` | Memoria dinamica per il Token Bucket (Tokens e Timestamp per UL/DL) |
+| `COUNTERS` | `PerCpuArray<u64>` | Indice globale (`u32`) | Numero occorrenze | Statistiche globali (Forward, Drop, QoS Drop, Decap, Encap, Errori) | 
 | `QFI_COUNTERS` | `PerCpuArray<u64>` | Valore QFI (`u32`) | Numero occorrenze | Statistiche divise per flussi QoS | 
 | `IP_EVENTS` | `AsyncRingBuf` | – | `GtpPair` | Eventi non-bloccanti verso userspace | 
 
@@ -74,9 +79,9 @@ Al momento dell'avvio, il loader userspace inietta le seguenti regole di test ne
 
 | Direzione | Chiave (TEID/IP) | PDR Hit | FAR assegnato | Azione risultante | 
 | ----- | ----- | ----- | ----- | ----- | 
-| Uplink | TEID 9999 | Sì | 1 | `FORWARD` + `DECAP` (Tracciato nei contatori) | 
+| Uplink | TEID 9999 | Sì | 1 | `FORWARD` + `DECAP` (Sottoposto a controllo QoS MBR) | 
 | Uplink | TEID 8888 | Sì | 2 | `DROP` (Tracciato nei contatori) | 
-| Downlink | IP 10.60.0.1 | Sì | 3 | `FORWARD` + `ENCAP` (Crea Header GTP con TEID 7001 e inserisce QFI 5) | 
+| Downlink | IP 10.60.0.1 | Sì | 3 | `FORWARD` + `ENCAP` (Crea GTP/TEID 7001, QFI 5, Sottoposto a controllo QoS MBR) | 
 | *Qualsiasi* | Altro | No | \- | `PASS` (Fallback di sicurezza) | 
 
 #### 🛠️ Build ed Esecuzione
@@ -85,7 +90,7 @@ Al momento dell'avvio, il loader userspace inietta le seguenti regole di test ne
 
 Assicurati che il tuo `Cargo.toml` workspace sia configurato (e i profili `panic = 'abort'` siano impostati nella root), poi lancia:
 
-```
+```bash
 cargo +nightly xtask build-ebpf
 cargo build --release
 ```
@@ -98,25 +103,25 @@ Esegui lo script di setup (`scripts/setup_netns.sh`) per creare la topologia a n
 
 Avvia il manager (user-space) sull'interfaccia collegata alla rete radio (es. `veth-n3`) o core (`veth-n6`). Utilizzerà automaticamente la modalità *SKB (Generic XDP)*.
 
-```
+```bash
 cargo run --release -- --iface veth-n3
-
+# In alternativa per il Downlink
 RUST_LOG=info cargo run --release -- --iface veth-n6
 ```
 
-##### 4. Test del traffico Uplink e Downlink
+##### 4. Test del traffico Uplink, Downlink e Rate Limiting
 
-In terminali separati, usa gli script Python con Scapy per testare decapsulazione e incapsulazione, intercettando l'esito tramite tcpdump.
+In terminali separati, usa gli script Python con Scapy per testare decapsulazione, incapsulazione e il policing QoS, intercettando l'esito tramite tcpdump.
 
 **Test Uplink (Decap):**
 
-```
+```bash
 sudo ip netns exec gnb python3 scripts/netns_decap_test.py
 ```
 
-**Test Downlink (Encap):**
+**Test Downlink e QoS (Encap):**
 
-```
+```bash
 sudo ip netns exec dn python3 scripts/netns_encap_test.py
 ```
 
@@ -125,25 +130,14 @@ sudo ip netns exec dn python3 scripts/netns_encap_test.py
 #### 🛣️ Roadmap e Prossimi Sviluppi
 
 * \[x\] Parsing base GTP-U in XDP ed eventi verso userspace.
-
 * \[x\] Gestione PDR e FAR tramite mappe eBPF.
-
 * \[x\] Contatori di esito per-CPU.
-
 * \[x\] Parsing avanzato GTP-U (Ext. Headers, PDU Session Container, estrazione QFI).
-
 * \[x\] Statistiche basate sui flussi QoS (QFI).
-
 * \[x\] **Rifattorizzazione Modulare e Ottimizzazione Asincrona (Tokio AsyncRingBuf).**
-
 * \[x\] **Decapsulazione Uplink:** Rimozione dinamica dell'header esterno tramite `bpf_xdp_adjust_head`, re-inoltro e validazione IP interno (`CNT_ERR_INNER_IP`).
-
 * \[x\] **Incapsulazione Downlink:** Implementato il percorso inverso con calcolo del checksum IPv4.
-
 * \[x\] **Inserimento dinamico del QFI:** Scrittura del *PDU Session Container* nell'header incapsulato tramite Lookup QER in Downlink.
-
-* \[ \] Implementazione logiche QER (QoS Enforcement Rule) per il Rate Limiting.
-
+* \[x\] **Rate Limiting (QoS Policing):** Implementazione logiche QER per far rispettare il Maximum Bit Rate (MBR) tramite Token Bucket algorithm (UL e DL).
+* \[ \] Integrazione con un control plane dinamico in user-space (CLI/API) per inserimento regole a runtime.
 * \[ \] (Opzionale) Implementazione instradamento accelerato bypassando lo stack di rete tramite `XDP_REDIRECT` e `bpf_fib_lookup`.
-
-* \[ \] Integrazione con un control plane (es. PFCP) per modifiche dinamiche a runtime.
