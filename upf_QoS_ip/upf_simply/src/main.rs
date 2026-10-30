@@ -6,7 +6,7 @@ use log::{warn};
 use tokio::{signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer,
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 
@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     });
     // MAPPA UL-PDR
     let mut ul_pdr_map: HashMap<_, u32, Pdr> = HashMap::try_from(ebpf.map_mut("UL_PDR_MAP").unwrap())?;
-    ul_pdr_map.insert(9999, Pdr { far_id: 1, outer_hdr_removed: 1, qer_id: 0, _pad: [0;3]}, 0)?;
+    ul_pdr_map.insert(9999, Pdr { far_id: 1, outer_hdr_removed: 1, qer_id: 1, _pad: [0;3]}, 0)?;
     ul_pdr_map.insert(8888, Pdr { far_id: 2, outer_hdr_removed: 1, qer_id: 0, _pad: [0;3]}, 0)?;
 
     // MAPPA DL-PDR
@@ -82,9 +82,19 @@ async fn main() -> anyhow::Result<()> {
                                         peer_ip: Ipv4Addr::new(10, 0, 3, 2).to_bits(), peer_teid: 7001,
                                         local_ip: Ipv4Addr::new(10, 0, 3, 1).to_bits() }, 0)?;
 
+    // Calcolo del MBR scalato (Byte/s)
+    let calc_mbr_scaled = |bits_per_sec: u64| -> u64 {
+        ((bits_per_sec / 8) << 30) / 1_000_000_000
+    };
+     
     // MAPPA QER
     let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
-    qer_map.insert(1, Qer {qfi: 5, _pad: [0; 3], mbr_dl: 0, mbr_ul: 0}, 0)?;
+    qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
+
+    // MAPP QER-STATE
+    let mut qer_state_map = HashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
+    qer_state_map.insert(0, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 0, tokens_ul: 100}, 0)?; // uplink
+    qer_state_map.insert(1, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
 
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("upf_simply").unwrap().try_into()?;
@@ -125,21 +135,23 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    
+    println!("---FINAL REPORT----");
     let _ = print_qfi(&qfi_counters);
     let _ = print_counters(&counters);
+    println!("-----------");
     Ok(())
 }
 
 fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()> {
     let voci = [
         (CNT_FORWARD, "forward"),
+        (CNT_DECAP, "pkts decapsulati"),
+        (CNT_ENCAP, "pkts incapsulati"),
         (CNT_DROP_FAR, "drop (FAR)"),
+        (CNT_DROP_QOS, "drop (QOS)"),
         (CNT_NO_PDR, "nessun PDR"),
         (CNT_NO_FAR, "nessun FAR"),
         (CNT_NO_QFI, "nessuna QFI"),
-        (CNT_DECAP, "pkts decapsulati"),
-        (CNT_ENCAP, "pkts incapsulati"),
         (CNT_ERR_INNER_IPV4, "inner pkt not ipv4"),
         (CNT_ERR, "general pkt errors:"),
         

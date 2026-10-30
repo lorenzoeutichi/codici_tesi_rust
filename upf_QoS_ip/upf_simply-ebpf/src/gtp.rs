@@ -17,6 +17,7 @@ pub struct GtpInfo {
     pub msg_type: u8,
     pub teid: u32,
     pub qfi: u8,
+    pub tot_length: u16,
     pub payload_offset: usize,
 }
 
@@ -64,6 +65,7 @@ pub fn parse_gtp(ctx: &XdpContext, start_offset: usize) -> Result<GtpInfo, u32> 
         msg_type: unsafe { (*gtp).msg_type },
         teid: u32::from_be(unsafe { (*gtp).teid }),
         qfi: qfi,
+        tot_length: u16::from_be(unsafe { (*gtp).length }),
         payload_offset: off_byte,
     })
 }

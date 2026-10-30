@@ -42,11 +42,24 @@ pub const FAR_FORWARD: u8 = 1;
 #[derive(Clone, Copy, Debug)]
 pub struct Qer {
     pub qfi: u8,
-    pub _pad: [u8; 3],
-    pub mbr_ul: u32,
-    pub mbr_dl: u32,
+    pub _pad: [u8; 7],
+    pub mbr_ul_scaled: u64,      // Maximum Bit Rate scalato (in byte) per l'Uplink (pre-calcolato dall'userspace)
+    pub mbr_dl_scaled: u64,      // MBR scalato per il Downlink
+    pub burst_ul: u64,    // Burst Size in byte per l'Uplink
+    pub burst_dl: u64,    // Burst Size in byte per il Downlink 
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct QerState {
+    pub last_update_ul: u64, // Timestamp in nanosecondi
+    pub last_update_dl: u64,
+    pub tokens_ul: u64,   // Token disponibili per l'Uplink (in Byte)
+    pub tokens_dl: u64,   // Token disponibili per il Downlink (in Byte)
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for QerState {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Pdr {}
 #[cfg(feature = "user")]
@@ -63,5 +76,6 @@ pub const CNT_DECAP: u32 = 5;
 pub const CNT_ENCAP: u32 = 6;
 pub const CNT_ERR_INNER_IPV4: u32 = 7;
 pub const CNT_ERR: u32 = 8; // racchiude tutti gli errori generici sui pkts
-pub const CNT_MAX: u32 = 9;
+pub const CNT_DROP_QOS: u32 = 9;
+pub const CNT_MAX: u32 = 10;
 
