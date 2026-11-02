@@ -1,7 +1,7 @@
 use core::mem;
 use aya_ebpf::programs::XdpContext;
 use aya_log_ebpf::info;
-use network_types::{eth::EthHdr, ip::{IpProto, Ipv4Hdr}};
+use network_types::ip::{IpProto, Ipv4Hdr};
 use upf_simply_common::CNT_ERR;
 
 #[derive(Clone, Copy)]
@@ -34,13 +34,12 @@ pub fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, u32> {
 }
 
 #[inline(always)]
-pub fn parse_ipv4(ctx: &XdpContext) -> Result<Ipv4Info, u32> {
-    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, EthHdr::LEN).map_err(|_| {
+pub fn parse_ipv4(ctx: &XdpContext, offset: usize) -> Result<Ipv4Info, u32> {
+    let ipv4hdr: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
         info!(ctx, "ip: fuori bounds");
         CNT_ERR
     })?;
     let ihl = unsafe { (*ipv4hdr).ihl() } as usize;
-    info!(ctx, "ihl bytes = {}", ihl as u32);
     if ihl < Ipv4Hdr::LEN {
         info!(ctx, "ip hdr troppo piccolo");
         return Err(CNT_ERR);

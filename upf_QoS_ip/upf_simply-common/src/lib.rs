@@ -43,19 +43,28 @@ pub const FAR_FORWARD: u8 = 1;
 pub struct Qer {
     pub qfi: u8,
     pub _pad: [u8; 7],
-    pub mbr_ul_scaled: u64,      // Maximum Bit Rate scalato (in byte) per l'Uplink (pre-calcolato dall'userspace)
-    pub mbr_dl_scaled: u64,      // MBR scalato per il Downlink
-    pub burst_ul: u64,    // Burst Size in byte per l'Uplink
-    pub burst_dl: u64,    // Burst Size in byte per il Downlink 
+    pub ns_per_byte_ul: u64,   // quanti ns costa un sigolo byte
+    pub ns_per_byte_dl: u64,
+    pub burst_tolerance_ns_ul: u64, //Burst Size in nanosec per l'Uplink
+    pub burst_tolerance_ns_dl: u64,
+    // pub mbr_ul_scaled: u64,      // Maximum Bit Rate scalato (in byte) per l'Uplink (pre-calcolato dall'userspace)
+    // pub mbr_dl_scaled: u64,      // MBR scalato per il Downlink
+    // pub burst_ul: u64,    // Burst Size in byte per l'Uplink
+    // pub burst_dl: u64,    // Burst Size in byte per il Downlink 
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct QerState {
-    pub last_update_ul: u64, // Timestamp in nanosecondi
-    pub last_update_dl: u64,
-    pub tokens_ul: u64,   // Token disponibili per l'Uplink (in Byte)
-    pub tokens_dl: u64,   // Token disponibili per il Downlink (in Byte)
+
+    pub tat_ul: u64,    //Theoretical Arrival Time
+    pub _pad: [u8;56],
+    pub tat_dl: u64
+
+    // pub last_update_ul: u64, // Timestamp in nanosecondi
+    // pub last_update_dl: u64,
+    // pub tokens_ul: u64,   // Token disponibili per l'Uplink (in Byte)
+    // pub tokens_dl: u64,   // Token disponibili per il Downlink (in Byte)
 }
 
 #[cfg(feature = "user")]
@@ -77,5 +86,6 @@ pub const CNT_ENCAP: u32 = 6;
 pub const CNT_ERR_INNER_IPV4: u32 = 7;
 pub const CNT_ERR: u32 = 8; // racchiude tutti gli errori generici sui pkts
 pub const CNT_DROP_QOS: u32 = 9;
-pub const CNT_MAX: u32 = 10;
+pub const CNT_NO_QER: u32 = 10;
+pub const CNT_MAX: u32 = 11;
 

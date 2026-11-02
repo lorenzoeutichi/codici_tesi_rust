@@ -1,4 +1,4 @@
-use aya_ebpf::{macros::map, maps::{HashMap, PerCpuArray, RingBuf}};
+use aya_ebpf::{macros::map, maps::{HashMap, PerCpuArray, PerCpuHashMap, RingBuf}};
 use upf_simply_common::{CNT_MAX, Far, N_CONT, Pdr, Qer, QerState};
 
 #[map]
@@ -10,7 +10,7 @@ pub(crate) static FAR_MAP: HashMap<u32, Far> = HashMap::with_max_entries(1024, 0
 #[map]
 pub(crate) static QER_MAP: HashMap<u32, Qer> = HashMap::with_max_entries(1024, 0); // chiave QER_ID (sola lettura)
 #[map]
-pub(crate) static QER_STATE_MAP: HashMap<u32, QerState> = HashMap::with_max_entries(1024, 0); // chiave QER_ID
+pub(crate) static QER_STATE_MAP: PerCpuHashMap<u32, QerState> = PerCpuHashMap::with_max_entries(1024, 0); // chiave QER_ID
 #[map]
 pub(crate) static DL_PDR_MAP: HashMap<u32, Pdr> = HashMap::with_max_entries(1024, 0); // chiave UE IP
 #[map]

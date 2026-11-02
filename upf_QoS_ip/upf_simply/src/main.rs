@@ -1,12 +1,13 @@
 use anyhow::Context as _;
-use aya::programs::{Xdp, XdpMode};
+use aya::{maps::PerCpuHashMap, programs::{Xdp, XdpMode}};
+use aya::util::nr_cpus;
 use clap::Parser;
 #[rustfmt::skip]
 use log::{warn};
 use tokio::{signal, sync::mpsc, time::Instant};
-use aya::maps::{RingBuf, HashMap, PerCpuArray};
+use aya::maps::{RingBuf, HashMap, PerCpuArray, PerCpuValues};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 
@@ -72,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
     // MAPPA DL-PDR
     let mut dl_pdr_map: HashMap<_, u32, Pdr> = HashMap::try_from(ebpf.map_mut("DL_PDR_MAP").unwrap())?;
-    dl_pdr_map.insert(Ipv4Addr::new(10, 60, 0, 1).to_bits(), Pdr{ far_id: 3, qer_id: 1, outer_hdr_removed: 0, _pad: [0;3]}, 0)?;
+    dl_pdr_map.insert(Ipv4Addr::new(10, 60, 0, 1).to_bits(), Pdr{ far_id: 3, qer_id: 2, outer_hdr_removed: 0, _pad: [0;3]}, 0)?;
     
     // MAPPA FAR
     let mut far_map: HashMap<_, u32, Far> = HashMap::try_from(ebpf.map_mut("FAR_MAP").unwrap())?;
@@ -83,23 +84,56 @@ async fn main() -> anyhow::Result<()> {
                                         local_ip: Ipv4Addr::new(10, 0, 3, 1).to_bits() }, 0)?;
 
     // Calcolo del MBR scalato (Byte/s)
-    let calc_mbr_scaled = |bits_per_sec: u64| -> u64 {
-        ((bits_per_sec / 8) << 30) / 1_000_000_000
+    // let calc_mbr_scaled = |bits_per_sec: u64| -> u64 {
+    //     ((bits_per_sec / 8) << 30) / 1_000_000_000
+    // };
+
+    let calc_ns_per_byte_scaled = |bits_per_sec: u64| -> u64 {
+        let bytes_per_sec = bits_per_sec / 8;
+    // Moltiplica 1 secondo (10^9 ns) per 2^30 prima di dividere per i Byte/s
+        (1_000_000_000u64 << 30) / bytes_per_sec
     };
-     
+    // 2. Calcolo della tolleranza di burst in nanosecondi reali (non scalati)
+    let calc_burst_tolerance_ns = |bits_per_sec: u64, burst_bytes: u64| -> u64 {
+        let bytes_per_sec = bits_per_sec / 8;
+        // Moltiplica prima per evitare troncamenti
+        (burst_bytes * 1_000_000_000u64) / bytes_per_sec
+    };
+    
+    
+    let mbr_bps = 10_000_000; // Esempio: 10 Mbps
+    let burst_bytes = 1000;
+    // Calcola quante code hardware/CPU stanno elaborando il traffico
+    let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64;
+    let mbr_bps_per_cpu = mbr_bps / num_cpus;
+    let burst_bytes_per_cpu = burst_bytes / num_cpus;
+
     // MAPPA QER
     let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
-    qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
+    qer_map.insert(1, Qer {
+        qfi: 5, _pad: [0; 7], ns_per_byte_dl: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
+        ns_per_byte_ul: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
+        burst_tolerance_ns_dl: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu), 
+        burst_tolerance_ns_ul: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu)}, 0)?;
+    
+    qer_map.insert(2, Qer {
+        qfi: 5, _pad: [0; 7], ns_per_byte_dl: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
+        ns_per_byte_ul: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
+        burst_tolerance_ns_dl: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu), 
+        burst_tolerance_ns_ul: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu)}, 0)?;
+    // qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
+    // qer_map.insert(2, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
 
     // MAPP QER-STATE
-    let mut qer_state_map = HashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
-    qer_state_map.insert(0, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 0, tokens_ul: 100}, 0)?; // uplink
-    qer_state_map.insert(1, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
+    let mut qer_state_map: PerCpuHashMap<&mut aya::maps::MapData, u32, QerState> = PerCpuHashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
+    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, _pad: [0; 56], tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // uplink
+    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, _pad: [0; 56], tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // downlink
+    // qer_state_map.insert(2, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
 
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("upf_simply").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpMode::Skb)
+    program.attach(&iface, XdpMode::default())
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
@@ -148,9 +182,10 @@ fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()
         (CNT_DECAP, "pkts decapsulati"),
         (CNT_ENCAP, "pkts incapsulati"),
         (CNT_DROP_FAR, "drop (FAR)"),
-        (CNT_DROP_QOS, "drop (QOS)"),
+        (CNT_DROP_QOS, "drop (QoS)"),
         (CNT_NO_PDR, "nessun PDR"),
         (CNT_NO_FAR, "nessun FAR"),
+        (CNT_NO_QER, "nessuna QER"),
         (CNT_NO_QFI, "nessuna QFI"),
         (CNT_ERR_INNER_IPV4, "inner pkt not ipv4"),
         (CNT_ERR, "general pkt errors:"),

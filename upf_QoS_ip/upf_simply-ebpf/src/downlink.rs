@@ -1,7 +1,7 @@
 use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{bpf_ktime_get_ns, bpf_xdp_adjust_head}, programs::XdpContext};
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, udp::UdpHdr};
-use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_FORWARD, Far, NO_QFI};
+use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, Far, NO_QFI};
 use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count, count_qfi}, net::{Ipv4Info, ptr_at_mut}};
 
 
@@ -29,7 +29,7 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                 None => return Err(CNT_NO_FAR),
                 Some(far) => match far.action {
                     FAR_FORWARD => {
-                        if police_dl(pdr.qer_id, ip.total_length).is_err() {
+                        if police_dl(ctx,pdr.qer_id, ip.total_length).is_err() {
                             count(CNT_DROP_QOS);
                             return Ok(XDP_DROP)
                         }
@@ -37,7 +37,6 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                             return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi)
                         }
                         count(CNT_FORWARD);
-
                     }
                     _ => {
                         count(CNT_DROP_FAR);
@@ -52,40 +51,41 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 }
 
 #[inline(always)]
-fn police_dl(qer_id: u32, tot_length: u16) -> Result<u32, ()> {
-    match unsafe { QER_MAP.get(&qer_id) } {
+fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
+    match unsafe { QER_MAP.get(&qer_id)} {
         None => {
+            count(CNT_NO_QER);
             return Ok(XDP_PASS);
         }
-        Some(qer) => match { QER_STATE_MAP.get_ptr_mut(&qer_id)} {
-            None => { return Ok(XDP_PASS) }
-            Some(ptr_qer) => {
-                if ptr_qer.is_null() {
-                    return Ok(XDP_PASS)
-                }
-                let now = unsafe { bpf_ktime_get_ns() };
-                unsafe { if  (*ptr_qer).last_update_dl == 0  {
-                    (*ptr_qer).last_update_dl = now;
+        Some(qer) => {
+            let cost_ip_pkt = (ip_tot_length as u64 * qer.ns_per_byte_ul) >> 30;
+            let now = unsafe {bpf_ktime_get_ns() };
+            match QER_STATE_MAP.get_ptr_mut(&qer_id) {
+                None => { 
+                    count(CNT_NO_QER);
+                    return Ok(XDP_PASS) }
+                Some(ptr_qer) => {
+                    if ptr_qer.is_null() {
+                        return Ok(XDP_PASS);
                     }
-                    let delta_ns = now - (*ptr_qer).last_update_dl;
-                    let nuovi_token = (delta_ns * qer.mbr_dl_scaled) >> 30;
-                    (*ptr_qer).tokens_dl += nuovi_token;
-                    if (*ptr_qer).tokens_dl > qer.burst_dl {
-                        (*ptr_qer).tokens_dl = qer.burst_dl
+                    // Accesso sicuro e diretto: questa memoria è esclusiva della CPU corrente
+                    let current_tat = unsafe { (*ptr_qer).tat_ul };
+                    let time_base = core::cmp::max(current_tat, now);
+                    let new_tat = time_base + cost_ip_pkt;
+
+                    if new_tat - now > qer.burst_tolerance_ns_ul {
+                        return Err(()); // Supera il burst: Drop QoS
                     }
-                    if (*ptr_qer).tokens_dl >= tot_length as u64 {
-                        (*ptr_qer).tokens_dl -= tot_length as u64;
-                        (*ptr_qer).last_update_dl = now;
-                        return Ok(XDP_PASS)
-                    } else {
-                        (*ptr_qer).last_update_dl = now;
-                        return Err(());
-                    }
+
+                    // Aggiornamento
+                    unsafe { (*ptr_qer).tat_ul = new_tat; }
+                    Ok(XDP_PASS)
                 }
             }
         }
     }
 }
+
 
 #[inline(always)]
 fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8) -> Result<u32, u32> {
@@ -166,3 +166,44 @@ fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
     conta = (conta >> 16) + (conta & 0xFFFF); 
     return u16::to_be(!(conta as u16)); //dato che la somma lavora con valori già in Network Order
 }
+
+
+/* // TOKEN BUFFER 
+#[inline(always)]
+fn police_dl(ctx: &XdpContext, qer_id: u32, tot_length: u16) -> Result<u32, ()> {
+    match unsafe { QER_MAP.get(&qer_id) } {
+        None => {
+            return Ok(XDP_PASS);
+        }
+        Some(qer) => match { QER_STATE_MAP.get_ptr_mut(&qer_id)} {
+            None => { return Ok(XDP_PASS) }
+            Some(ptr_qer) => {
+                if ptr_qer.is_null() {
+                    return Ok(XDP_PASS)
+                }
+                let now = unsafe { bpf_ktime_get_ns() };
+                unsafe { if  (*ptr_qer).last_update_dl == 0  {
+                    (*ptr_qer).last_update_dl = now;
+                    }
+                    let delta_ns = now - (*ptr_qer).last_update_dl;
+                    let nuovi_token = (delta_ns * qer.mbr_dl_scaled) >> 30;
+                    (*ptr_qer).tokens_dl += nuovi_token;
+                    if (*ptr_qer).tokens_dl > qer.burst_dl {
+                        (*ptr_qer).tokens_dl = qer.burst_dl
+                    }
+                    if (*ptr_qer).tokens_dl >= tot_length as u64 {
+                        (*ptr_qer).tokens_dl -= tot_length as u64;
+                        (*ptr_qer).last_update_dl = now;
+                        info!(ctx, "pkt dentro limiti MBR");
+                        return Ok(XDP_PASS)
+                    } else {
+                        (*ptr_qer).last_update_dl = now;
+                        info!(ctx, "pkt supera i limiti MBR");
+                        return Err(());
+                    }
+                }
+            }
+        }
+    }
+}
+*/

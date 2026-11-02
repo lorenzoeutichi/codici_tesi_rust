@@ -39,7 +39,7 @@ fn try_upf_simply(ctx: &XdpContext) -> Result<u32, u32> {
     }
     
     let eth_hdr_copy = unsafe { *ethhdr };
-    let ip_info = net::parse_ipv4(ctx)?;
+    let ip_info = net::parse_ipv4(ctx, EthHdr::LEN)?;
 
     if ip_info.next_proto == IpProto::Udp {
         let udp_offset = EthHdr::LEN + (ip_info.ihl_bytes & 0xFF);

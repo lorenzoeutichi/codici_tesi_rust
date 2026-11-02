@@ -2,9 +2,10 @@ use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
 };
-use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count, count_qfi}, net::{ptr_at, ptr_at_mut}};
+use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count, count_qfi}, net::{parse_ipv4, ptr_at, ptr_at_mut}};
+
 
 #[inline(always)]
 pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u32, u32> {
@@ -38,7 +39,9 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
             }
             Some(far) => match far.action {
                 FAR_FORWARD => {
-                    if police_ul(pdr.qer_id, gtp.tot_length).is_err() {
+                    let ip_length = parse_ipv4(ctx, gtp.payload_offset)?.total_length;
+                    info!(ctx, "lunghezza pkt ip interno: {}", ip_length);
+                    if police_ul(pdr.qer_id, ip_length).is_err() { // gli devo passa la lunghezza del pkt ip 
                         count(CNT_DROP_QOS);
                         return Ok(XDP_DROP);
                     }
@@ -60,9 +63,70 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
     Ok(XDP_PASS)
 }
 
+#[inline(always)]
+fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
+    match unsafe { QER_MAP.get(&qer_id)} {
+        None => {
+            count(CNT_NO_QER);
+            return Ok(XDP_PASS);
+        }
+        Some(qer) => {
+            let cost_ip_pkt = (ip_tot_length as u64 * qer.ns_per_byte_ul) >> 30;
+            let now = unsafe {bpf_ktime_get_ns() };
+            match QER_STATE_MAP.get_ptr_mut(&qer_id) {
+                None => { 
+                    count(CNT_NO_QER);
+                    return Ok(XDP_PASS) }
+                Some(ptr_qer) => {
+                    if ptr_qer.is_null() {
+                        return Ok(XDP_PASS);
+                    }
+                    // Accesso sicuro e diretto: questa memoria è esclusiva della CPU corrente
+                    let current_tat = unsafe { (*ptr_qer).tat_ul };
+                    let time_base = core::cmp::max(current_tat, now);
+                    let new_tat = time_base + cost_ip_pkt;
+
+                    if new_tat - now > qer.burst_tolerance_ns_ul {
+                        return Err(()); // Supera il burst: Drop QoS
+                    }
+
+                    // Aggiornamento
+                    unsafe { (*ptr_qer).tat_ul = new_tat; }
+                    Ok(XDP_PASS)
+                }
+            }
+        }
+    }
+}
+
 
 #[inline(always)]
-fn police_ul(qer_id: u32, tot_length: u16) -> Result<u32, ()> {
+fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32, u32> {
+    let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
+        info!(ctx, "inner ip: fuori bounds");
+        CNT_ERR_INNER_IPV4
+    })?;
+    if unsafe { (*inner_ip).version() } != 4 {
+        info!(ctx, "inner ip: versione non 4");
+        return Err(CNT_ERR_INNER_IPV4);
+    }
+    
+    let delta: i32 = (offset - EthHdr::LEN) as i32; // byte di pkt da togliere (dall'outer ip al gtp-u)
+    if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta).is_negative() } {
+        return Err(CNT_ERR);
+    }
+    
+    let eth_header_mut: *mut EthHdr = ptr_at_mut(ctx, 0)?; // in realtà sono 14 byte di GTP-U
+    unsafe { *eth_header_mut = eth_hdr_copy; } 
+    
+    count(CNT_DECAP);
+    count(CNT_FORWARD);
+    Ok(XDP_PASS)
+}
+
+// token buffer
+/* #[inline(always)] 
+fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
     match unsafe { QER_MAP.get(&qer_id) } {
         None => {
             return Ok(XDP_PASS);
@@ -83,8 +147,8 @@ fn police_ul(qer_id: u32, tot_length: u16) -> Result<u32, ()> {
                     if (*ptr_qer).tokens_ul > qer.burst_ul {
                         (*ptr_qer).tokens_ul = qer.burst_ul
                     }
-                    if (*ptr_qer).tokens_ul >= tot_length as u64 {
-                        (*ptr_qer).tokens_ul -= tot_length as u64;
+                    if (*ptr_qer).tokens_ul >= ip_tot_length as u64 {
+                        (*ptr_qer).tokens_ul -= ip_tot_length as u64;
                         (*ptr_qer).last_update_ul = now;
                         return Ok(XDP_PASS)
                     } else {
@@ -95,29 +159,4 @@ fn police_ul(qer_id: u32, tot_length: u16) -> Result<u32, ()> {
             }
         }
     }
-}
-
-
-#[inline(always)]
-fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32, u32> {
-    let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
-        info!(ctx, "inner ip: fuori bounds");
-        CNT_ERR_INNER_IPV4
-    })?;
-    if unsafe { (*inner_ip).version() } != 4 {
-        info!(ctx, "inner ip: versione non 4");
-        return Err(CNT_ERR_INNER_IPV4);
-    }
-
-    let delta: i32 = (offset - EthHdr::LEN) as i32; // byte di pkt da togliere (dall'outer ip al gtp-u)
-    if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta).is_negative() } {
-        return Err(CNT_ERR);
-    }
-    
-    let eth_header_mut: *mut EthHdr = ptr_at_mut(ctx, 0)?; // in realtà sono 14 byte di GTP-U
-    unsafe { *eth_header_mut = eth_hdr_copy; } 
-    
-    count(CNT_DECAP);
-    count(CNT_FORWARD);
-    Ok(XDP_PASS)
-}
+} */
