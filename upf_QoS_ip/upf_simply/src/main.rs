@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
                                         peer_ip: Ipv4Addr::new(10, 0, 3, 2).to_bits(), peer_teid: 7001,
                                         local_ip: Ipv4Addr::new(10, 0, 3, 1).to_bits() }, 0)?;
 
-    // Calcolo del MBR scalato (Byte/s)
+    // Calcolo del MBR scalato (Byte/s) per Token Bucket
     // let calc_mbr_scaled = |bits_per_sec: u64| -> u64 {
     //     ((bits_per_sec / 8) << 30) / 1_000_000_000
     // };
@@ -93,20 +93,18 @@ async fn main() -> anyhow::Result<()> {
     // Moltiplica 1 secondo (10^9 ns) per 2^30 prima di dividere per i Byte/s
         (1_000_000_000u64 << 30) / bytes_per_sec
     };
-    // 2. Calcolo della tolleranza di burst in nanosecondi reali (non scalati)
+    // 2. Calcolo della tolleranza di burst in nanosecondi 
     let calc_burst_tolerance_ns = |bits_per_sec: u64, burst_bytes: u64| -> u64 {
-        let bytes_per_sec = bits_per_sec / 8;
-        // Moltiplica prima per evitare troncamenti
-        (burst_bytes * 1_000_000_000u64) / bytes_per_sec
+        burst_bytes * calc_ns_per_byte_scaled(bits_per_sec) >> 30
     };
     
     
-    let mbr_bps = 10_000_000; // Esempio: 10 Mbps
-    let burst_bytes = 1000;
+    let mbr_bps = 100_000; 
+    let burst_bytes = 180;
     // Calcola quante code hardware/CPU stanno elaborando il traffico
     let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64;
     let mbr_bps_per_cpu = mbr_bps / num_cpus;
-    let burst_bytes_per_cpu = burst_bytes / num_cpus;
+    let burst_bytes_per_cpu = burst_bytes;
 
     // MAPPA QER
     let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
@@ -126,8 +124,8 @@ async fn main() -> anyhow::Result<()> {
 
     // MAPP QER-STATE
     let mut qer_state_map: PerCpuHashMap<&mut aya::maps::MapData, u32, QerState> = PerCpuHashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
-    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, _pad: [0; 56], tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // uplink
-    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, _pad: [0; 56], tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // downlink
+    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // uplink
+    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // downlink
     // qer_state_map.insert(2, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
 
     let Opt { iface } = opt;

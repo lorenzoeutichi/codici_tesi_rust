@@ -56,9 +56,7 @@ pub struct Qer {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct QerState {
-
     pub tat_ul: u64,    //Theoretical Arrival Time
-    pub _pad: [u8;56],
     pub tat_dl: u64
 
     // pub last_update_ul: u64, // Timestamp in nanosecondi

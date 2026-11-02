@@ -58,7 +58,7 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
             return Ok(XDP_PASS);
         }
         Some(qer) => {
-            let cost_ip_pkt = (ip_tot_length as u64 * qer.ns_per_byte_ul) >> 30;
+            let cost_ip_pkt = (ip_tot_length as u64 * qer.ns_per_byte_dl) >> 30;
             let now = unsafe {bpf_ktime_get_ns() };
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
@@ -69,16 +69,16 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
                         return Ok(XDP_PASS);
                     }
                     // Accesso sicuro e diretto: questa memoria è esclusiva della CPU corrente
-                    let current_tat = unsafe { (*ptr_qer).tat_ul };
+                    let current_tat = unsafe { (*ptr_qer).tat_dl };
                     let time_base = core::cmp::max(current_tat, now);
                     let new_tat = time_base + cost_ip_pkt;
 
-                    if new_tat - now > qer.burst_tolerance_ns_ul {
+                    if new_tat - now > qer.burst_tolerance_ns_dl {
                         return Err(()); // Supera il burst: Drop QoS
                     }
 
                     // Aggiornamento
-                    unsafe { (*ptr_qer).tat_ul = new_tat; }
+                    unsafe { (*ptr_qer).tat_dl = new_tat; }
                     Ok(XDP_PASS)
                 }
             }

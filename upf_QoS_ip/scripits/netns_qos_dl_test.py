@@ -1,53 +1,55 @@
 """
-Test della INCAPSULAZIONE downlink e RATE LIMITING (QoS).
+Test della INCAPSULAZIONE downlink e RATE LIMITING (GCRA/Per-CPU).
 
 Va eseguito DENTRO ns-dn:
     sudo ip netns exec ns-dn python3 netns_qos_dl_test.py
 
-Il test invia una raffica di pacchetti per saturare il limite MBR,
-attende la ricarica del Token Bucket, e invia un ultimo pacchetto.
+Il test sfrutta l'invio grezzo a livello di socket per abbattere le
+latenze di Scapy e misurare la reale applicazione del GCRA nell'XDP.
 
 Verifica, in un terminale:
     sudo ip netns exec ns-gnb tcpdump -i veth-gnb -n -vv -X udp port 2152
 Verifica, nell'altro terminale, i contatori del loader Rust (drop QoS).
 """
-import time
-from scapy.all import IP, UDP, Raw, send
-from netns_topology import UE_IP
 
+import time
+import socket
+from scapy.all import IP, UDP, Raw
+
+UE_IP = "10.60.0.1"
 UE_PORT = 3000
 
 def main():
-    # Creazione del pacchetto IP interno (36 byte totali: 20 IP + 8 UDP + 8 Raw)
+    # 20 byte (IP) + 8 byte (UDP) + 8 byte (Raw) = 36 byte
     pkt = IP(dst=UE_IP) / UDP(sport=6000, dport=UE_PORT) / Raw(b"hello-ue")
-
+    raw_pkt = bytes(pkt)
+    
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    
     print("==================================================")
-    print(" FASE 1: Raffica di 5 pacchetti (Saturazione QoS)")
+    print(" FASE 1: Raffica Raw Socket (Saturazione GCRA)")
     print("==================================================")
-    # Inviamo 5 pacchetti distanziati di soli 10ms.
-    # Se il burst_dl è 80 byte e il pacchetto pesa 36 byte:
-    # - Pkt 1 (Passa, restano 64 byte)
-    # - Pkt 2 (Passa, restano 28 byte)
-    # - Pkt 3, 4, 5 (DROP per QoS, token insufficienti)
-    for i in range(5):
-        send(pkt, verbose=False)
-        print(f"[{i+1}/5] Pacchetto inviato verso l'UE...")
-        time.sleep(0.01)
-
+    
+    # Invia 15 pacchetti consecutivi senza delay
+    burst_count = 15
+    start_time = time.perf_counter()
+    for _ in range(burst_count):
+        s.sendto(raw_pkt, (UE_IP, 0))
+    end_time = time.perf_counter()
+    
+    print(f"[{burst_count}/{burst_count}] Pacchetti inviati in {(end_time - start_time)*1000:.2f} ms")
+    
     print("\n==================================================")
-    print(" FASE 2: Attesa di 2 secondi (Ricarica Token)")
+    print(" FASE 2: Pausa per il reset del Theoretical Arrival Time")
     print("==================================================")
-    # A 50 byte/s, 2 secondi ricaricano 100 byte (capienza massima)
-    for i in range(2, 0, -1):
-        print(f"Attesa... {i}s")
-        time.sleep(1.0)
+    # 1 secondo è sufficiente per riazzerare il debito temporale
+    time.sleep(1.0)
 
-    print("\n==================================================")
-    print(" FASE 3: Pacchetto Post-Ricarica (Dovrebbe passare)")
     print("==================================================")
-    # Il secchio è di nuovo pieno, questo pacchetto deve passare
-    send(pkt, verbose=False)
-    print("[6/6] Pacchetto finale inviato! Controlla tcpdump e i contatori.\n")
+    print(" FASE 3: Pacchetto di recupero")
+    print("==================================================")
+    s.sendto(raw_pkt, (UE_IP, 0))
+    print("[16/16] Pacchetto finale inviato. Controlla tcpdump e i log di upf_simply.")
 
 if __name__ == "__main__":
     main()
