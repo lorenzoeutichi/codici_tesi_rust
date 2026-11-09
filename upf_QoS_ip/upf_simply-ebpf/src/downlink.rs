@@ -58,8 +58,7 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
             return Ok(XDP_PASS);
         }
         Some(qer) => {
-            let cost_ip_pkt = (ip_tot_length as u64 * qer.ns_per_byte_dl) >> 30;
-            let now = unsafe {bpf_ktime_get_ns() };
+
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count(CNT_NO_QER);
@@ -68,18 +67,35 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
                     if ptr_qer.is_null() {
                         return Ok(XDP_PASS);
                     }
+                    let now = unsafe {bpf_ktime_get_ns() };
+                    let cost_ip_pkt_p = (ip_tot_length as u64 * qer.pir_dl.ns_per_byte) >> 30;
+                    let cost_ip_pkt_c = (ip_tot_length as u64 * qer.cir_dl.ns_per_byte) >> 30;
+                    
                     // Accesso sicuro e diretto: questa memoria è esclusiva della CPU corrente
-                    let current_tat = unsafe { (*ptr_qer).tat_dl };
-                    let time_base = core::cmp::max(current_tat, now);
-                    let new_tat = time_base + cost_ip_pkt;
+                    // Peak
+                    let current_tat_pir = unsafe { (*ptr_qer).tat_pir_dl };
+                    let time_base_pir = core::cmp::max(current_tat_pir, now);
+                    let new_tat_pir = time_base_pir + cost_ip_pkt_p;
+                    // Committed
+                    let current_tat_cir = unsafe { (*ptr_qer).tat_cir_dl };
+                    let time_base_cir = core::cmp::max(current_tat_cir, now);
+                    let new_tat_cir = time_base_cir + cost_ip_pkt_c;
 
-                    if new_tat - now > qer.burst_tolerance_ns_dl {
-                        return Err(()); // Supera il burst: Drop QoS
+                    // Condizione ROSSO
+                    if new_tat_pir - now > qer.pir_dl.burst_tolerance_ns {
+                        return Err(());
                     }
-
-                    // Aggiornamento
-                    unsafe { (*ptr_qer).tat_dl = new_tat; }
-                    Ok(XDP_PASS)
+                    // Condizione GIALLO
+                    else if new_tat_cir - now > qer.cir_dl.burst_tolerance_ns {
+                        unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
+                        return Ok(XDP_PASS);
+                    }
+                    // Condizione VERDE
+                    else {
+                        unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
+                        unsafe { (*ptr_qer).tat_cir_dl = new_tat_cir; }
+                        return Ok(XDP_PASS);
+                    }
                 }
             }
         }

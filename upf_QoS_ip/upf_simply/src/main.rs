@@ -7,7 +7,7 @@ use log::{warn};
 use tokio::{signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray, PerCpuValues};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
+    BucketParam, CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 
@@ -88,7 +88,9 @@ async fn main() -> anyhow::Result<()> {
     //     ((bits_per_sec / 8) << 30) / 1_000_000_000
     // };
 
+    // 1. Calcolo del costo temporale (in nanosecondi) di un byte
     let calc_ns_per_byte_scaled = |bits_per_sec: u64| -> u64 {
+        if bits_per_sec == 0 { return 0; } // Gestione dei flussi non-QoS
         let bytes_per_sec = bits_per_sec / 8;
     // Moltiplica 1 secondo (10^9 ns) per 2^30 prima di dividere per i Byte/s
         (1_000_000_000u64 << 30) / bytes_per_sec
@@ -98,34 +100,44 @@ async fn main() -> anyhow::Result<()> {
         burst_bytes * calc_ns_per_byte_scaled(bits_per_sec) >> 30
     };
     
-    
+    // --- DEFINIZIONE PARAMETRI GLOBALI FLUSSO (Dal Control Plane) ---
     let mbr_bps = 100_000; 
-    let burst_bytes = 180;
+    let gbr_bps = 5_000;
+    let burst_mbr_bytes= 1500;
+    let burst_gbr_bytes = 1500;
     // Calcola quante code hardware/CPU stanno elaborando il traffico
     let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64;
+    // --- PARTIZIONE PER-CPU ---
     let mbr_bps_per_cpu = mbr_bps / num_cpus;
-    let burst_bytes_per_cpu = burst_bytes;
+    let gbr_bps_per_cpu = gbr_bps / num_cpus;
+    let burst_mbr_per_cpu = burst_mbr_bytes / num_cpus;
+    let burst_gbr_per_cpu = burst_gbr_bytes / num_cpus;
 
     // MAPPA QER
     let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
     qer_map.insert(1, Qer {
-        qfi: 5, _pad: [0; 7], ns_per_byte_dl: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
-        ns_per_byte_ul: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
-        burst_tolerance_ns_dl: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu), 
-        burst_tolerance_ns_ul: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu)}, 0)?;
+        qfi: 5, 
+        cir_ul: BucketParam { 
+            ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
+        pir_ul: BucketParam { 
+            ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
+        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }}, 0)?;
     
     qer_map.insert(2, Qer {
-        qfi: 5, _pad: [0; 7], ns_per_byte_dl: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
-        ns_per_byte_ul: calc_ns_per_byte_scaled(mbr_bps_per_cpu),
-        burst_tolerance_ns_dl: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu), 
-        burst_tolerance_ns_ul: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_bytes_per_cpu)}, 0)?;
+        qfi: 5, 
+        cir_ul: BucketParam { 
+            ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
+        pir_ul: BucketParam { 
+            ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
+        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }}, 0)?;
     // qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
     // qer_map.insert(2, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
 
+
     // MAPP QER-STATE
     let mut qer_state_map: PerCpuHashMap<&mut aya::maps::MapData, u32, QerState> = PerCpuHashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
-    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // uplink
-    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_ul: 0, tat_dl: 0}).collect::<Vec<_>>())?, 0)?; // downlink
+    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?, 0)?; // uplink
+    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?, 0)?; // downlink
     // qer_state_map.insert(2, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
 
     let Opt { iface } = opt;

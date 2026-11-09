@@ -42,11 +42,10 @@ pub const FAR_FORWARD: u8 = 1;
 #[derive(Clone, Copy, Debug)]
 pub struct Qer {
     pub qfi: u8,
-    pub _pad: [u8; 7],
-    pub ns_per_byte_ul: u64,   // quanti ns costa un sigolo byte
-    pub ns_per_byte_dl: u64,
-    pub burst_tolerance_ns_ul: u64, //Burst Size in nanosec per l'Uplink
-    pub burst_tolerance_ns_dl: u64,
+    pub cir_ul: BucketParam,
+    pub pir_ul: BucketParam,
+    pub cir_dl: BucketParam,
+    pub pir_dl: BucketParam,
     // pub mbr_ul_scaled: u64,      // Maximum Bit Rate scalato (in byte) per l'Uplink (pre-calcolato dall'userspace)
     // pub mbr_dl_scaled: u64,      // MBR scalato per il Downlink
     // pub burst_ul: u64,    // Burst Size in byte per l'Uplink
@@ -55,9 +54,19 @@ pub struct Qer {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
+pub struct BucketParam {
+    pub ns_per_byte: u64,
+    pub burst_tolerance_ns: u64,
+}
+
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 pub struct QerState {
-    pub tat_ul: u64,    //Theoretical Arrival Time
-    pub tat_dl: u64
+    pub tat_cir_ul: u64,    //Theoretical Arrival Time associato al Commited Information Rate
+    pub tat_pir_ul: u64,    //Theoretical Arrival Time associato al Peak Information Rate
+    pub tat_cir_dl: u64,    
+    pub tat_pir_dl: u64,
 
     // pub last_update_ul: u64, // Timestamp in nanosecondi
     // pub last_update_dl: u64,
@@ -73,6 +82,8 @@ unsafe impl aya::Pod for Pdr {}
 unsafe impl aya::Pod for Far {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for Qer {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BucketParam {}
 
 pub const CNT_FORWARD: u32 = 0;
 pub const CNT_DROP_FAR: u32 = 1;
