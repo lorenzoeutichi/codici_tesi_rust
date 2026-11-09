@@ -6,7 +6,7 @@ Un programma **XDP** intercetta il traffico, esegue un dispatch rigoroso tra flu
 
 Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tramite `AsyncRingBuf`, mentre le statistiche globali, gli errori specifici e il tracciamento per singolo flusso QoS vengono gestiti tramite mappe per-CPU ad alte prestazioni.
 
-> 🚀 **Stato:** Prototipo Avanzato. Il progetto sfrutta un'architettura modulare per superare i limiti del verifier eBPF. Sono ora pienamente implementate e validate sia la decapsulazione dinamica in Uplink, sia l'incapsulazione in Downlink con l'inserimento dinamico del *PDU Session Container* (QFI), ed è stato integrato con successo il sistema di **Rate Limiting bidirezionale basato su algoritmo GCRA (Generic Cell Rate Algorithm) lock-free**.
+> 🚀 **Stato:** Prototipo Avanzato. Il progetto sfrutta un'architettura modulare per superare i limiti del verifier eBPF. Sono ora pienamente implementate e validate sia la decapsulazione dinamica in Uplink, sia l'incapsulazione in Downlink con l'inserimento dinamico del *PDU Session Container* (QFI). Inoltre, è stata implementata l'architettura di Rate Limiting avanzato trTCM (Two Rate Three Color Marker) basato sull'algoritmo Dual GCRA Per-CPU.
 
 ## ✨ Funzionalità Attuali
 
@@ -20,13 +20,19 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
 
 * **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink) ed emissione dinamica in uscita (Downlink) del container `0x85` per la gestione del **QFI** (QoS Flow Identifier), estrapolato direttamente dal QER.
 
-* **Rate Limiting (QoS Policing):** Implementazione rigorosa del Rate Limiting bidirezionale (Uplink e Downlink) tramite algoritmo **GCRA (Generic Cell Rate Algorithm)**. Il controllo della banda applica il Maximum Bit Rate (MBR) definito nella QoS Enforcement Rule (QER). Sfruttando un design *lock-free* basato su mappe `PerCpuHashMap`, il sistema traccia il debito temporale (*Theoretical Arrival Time - TAT*) su ogni singola CPU, garantendo altissime prestazioni senza *contention*. I limiti temporali e i costi in nanosecondi per byte sono calcolati in user-space tramite bit-shift (`>> 30`) per aggirare i limiti del verifier, assicurando al contempo tolleranza precisa ai burst configurati.
+* **Rate Limiting Avanzato (trTCM / Dual GCRA):** Implementazione rigorosa del Rate Limiting bidirezionale (Uplink e Downlink) tramite architettura **Two Rate Three Color Marker (trTCM)**. L'algoritmo sfrutta un **Dual GCRA (Generic Cell Rate Algorithm)** adattato ai pacchetti IP per gestire contemporaneamente:
+
+  * **Committed Information Rate (CIR / GBR):** La banda garantita del flusso. Se ecceduta, il pacchetto consuma solo la banda di picco (Colore Giallo).
+
+  * **Peak Information Rate (PIR / MBR):** La banda massima assoluta. Se ecceduta, il pacchetto viene scartato istantaneamente con `XDP_DROP` (Colore Rosso).
+
+  * L'algoritmo opera su una `PerCpuHashMap` azzerando i conflitti tra CPU e calcola i limiti temporali tramite un moltiplicatore `Q30` pre-calcolato in user-space, garantendo massima scalabilità e pieno rispetto dei limiti matematici del verifier eBPF.
 
 * **Telemetry Asincrona in Tempo Reale:** Invio zero-latenza degli eventi (Msg Type, TEID, QFI) allo userspace tramite `AsyncRingBuf` (`GtpPair`), integrato nel runtime Tokio senza cicli di polling bloccanti.
 
 * **Control Plane eBPF:** Lookup ultra-veloce nel kernel space tramite `PDR_MAP`, `DL_PDR_MAP`, `FAR_MAP` e `QER_MAP`.
 
-* **Statistiche Dettagliate:** Contatori globali e per-CPU (inclusi drop, forward, decap, encap, QoS drop ed errori) e tracciamento del volume di traffico per ogni singolo valore QFI (0-63).
+* **Statistiche Dettagliate:** Contatori globali e per-CPU (inclusi drop, forward, decap, encap, limitazione QoS ed errori) e tracciamento del volume di traffico per ogni singolo valore QFI (0-63).
 
 ## 🏗️ Architettura del Flusso
 
@@ -47,47 +53,48 @@ Gli eventi vengono inviati allo userspace in modo **completamente asincrono** tr
                        │                               │
        FAR_MAP[far_id] ┴─ DROP/FORWARD                 ├─ FAR Action
                        │                               │
-            [ Rate Limiting (QoS) ]             [ Rate Limiting (QoS) ]
-           (Verifica GCRA TAT UL)              (Verifica GCRA TAT DL)
+        [ trTCM Rate Limiting (Dual GCRA) ]   [ trTCM Rate Limiting (Dual GCRA) ]
+         (Verifica CIR/PIR UL e Drop QoS)      (Verifica CIR/PIR DL e Drop QoS)
                        │                               │
-           [ Decapsulazione ]                   [ Incapsulazione ]
-           (Rimozione 36+ byte header ext)      (Aggiunta 44 byte: IP+UDP+GTP+Ext)
+           [ Decapsulazione (adjust_head) ]        [ Incapsulazione ]
+           (Rimozione 44 byte header ext)        (Aggiunta 44 byte: IP+UDP+GTP+Ext)
                        │                               │
               Invio evento su RingBuf            Calcolo Checksum IPv4
                        │                               │
                    XDP_PASS                        XDP_PASS
 
+
 ```
 
-#### 🗺️ Mappe eBPF
+###### 🗺️ Mappe eBPF
 
 | Nome Mappa | Tipo | Chiave | Valore | Scopo | 
 | ----- | ----- | ----- | ----- | ----- | 
-| `PDR_MAP` | `HashMap` | TEID (`u32`, host order) | `Pdr { far_id, qer_id... }` | Regole Forwarding Uplink | 
-| `DL_PDR_MAP` | `HashMap` | IP UE (`u32`, host order) | `Pdr { far_id, qer_id... }` | Regole Forwarding Downlink (Routing IP) | 
-| `FAR_MAP` | `HashMap` | `far_id` (`u32`) | `Far { action, ips... }` | Definisce l'azione e i parametri di tunnel | 
-| `QER_MAP` | `HashMap` | `qer_id` (`u32`) | `Qer { qfi, mbr...}` | QoS Enforcement Rules (Costo ns/byte e tolleranza burst) | 
-| `QER_STATE_MAP` | `PerCpuHashMap` | `qer_id` (`u32`) | `QerState` | Memoria dinamica per il GCRA (Theoretical Arrival Time per UL/DL, lock-free) | 
-| `COUNTERS` | `PerCpuArray<u64>` | Indice globale (`u32`) | Numero occorrenze | Statistiche globali (Forward, Drop, QoS Drop, Decap, Encap, Errori) | 
-| `QFI_COUNTERS` | `PerCpuArray<u64>` | Valore QFI (`u32`) | Numero occorrenze | Statistiche divise per flussi QoS | 
-| `IP_EVENTS` | `AsyncRingBuf` | – | `GtpPair` | Eventi non-bloccanti verso userspace | 
+| PDR_MAP | HashMap | TEID (u32, host order) | Pdr { far_id, qer_id... } | Regole Forwarding Uplink | 
+| DL_PDR_MAP | HashMap | IP UE (u32, host order) | Pdr { far_id, qer_id... } | Regole Forwarding Downlink (Routing IP) | 
+| FAR_MAP | HashMap | far_id (u32) | Far { action, ips... } | Definisce l'azione e i parametri di tunnel | 
+| QER_MAP | HashMap | qer_id (u32) | Qer { qfi, cir_ul, pir_ul...} | QoS Enforcement Rules (QFI mapping e costi temporali ns/byte) | 
+| QER_STATE_MAP | PerCpuHashMap | qer_id (u32) | QerState | Tracciamento temporale indipendente (TAT) per limiti GBR e MBR (Dual GCRA Per-CPU) | 
+| COUNTERS | PerCpuArray | Indice globale (u32) | Numero occorrenze | Statistiche globali (Forward, Drop, Decap, Encap, Errori) | 
+| QFI_COUNTERS | PerCpuArray | Valore QFI (u32) | Numero occorrenze | Statistiche divise per flussi QoS | 
+| IP_EVENTS | AsyncRingBuf | – | GtpPair | Eventi non-bloccanti verso userspace | 
 
 *(Gli indirizzi e il TEID estratti dal pacchetto vengono convertiti tramite `u32::from_be` nel kernel, per cui le chiavi di mappa sono in Host Byte Order).*
 
-#### ⚙️ Regole di Test Precaricate
+###### ⚙️ Regole di Test Precaricate
 
 Al momento dell'avvio, il loader userspace inietta le seguenti regole di test nelle mappe eBPF:
 
 | Direzione | Chiave (TEID/IP) | PDR Hit | FAR assegnato | Azione risultante | 
 | ----- | ----- | ----- | ----- | ----- | 
-| Uplink | TEID 9999 | Sì | 1 | `FORWARD` + `DECAP` (Sottoposto a controllo QoS MBR) | 
-| Uplink | TEID 8888 | Sì | 2 | `DROP` (Tracciato nei contatori) | 
-| Downlink | IP 10.60.0.1 | Sì | 3 | `FORWARD` + `ENCAP` (Crea GTP/TEID 7001, QFI 5, Sottoposto a controllo QoS MBR) | 
-| *Qualsiasi* | Altro | No | \- | `PASS` (Fallback di sicurezza) | 
+| Uplink | TEID 9999 | Sì | 1 | FORWARD + DECAP (Tracciato nei contatori, sottoposto a Rate Limiting) | 
+| Uplink | TEID 8888 | Sì | 2 | DROP (Tracciato nei contatori) | 
+| Downlink | IP 10.60.0.1 | Sì | 3 | FORWARD + ENCAP (Crea Header GTP con TEID 7001 e inserisce QFI 5, sottoposto a Rate Limiting) | 
+| *Qualsiasi* | Altro | No | \- | PASS (Fallback di sicurezza) | 
 
-#### 🛠️ Build ed Esecuzione
+###### 🛠️ Build ed Esecuzione
 
-##### 1. Compilazione (Kernel + Userspace)
+###### 1. Compilazione (Kernel + Userspace)
 
 Assicurati che il tuo `Cargo.toml` workspace sia configurato (e i profili `panic = 'abort'` siano impostati nella root), poi lancia:
 
@@ -96,13 +103,13 @@ cargo +nightly xtask build-ebpf
 cargo build --release
 ```
 
-##### 2. Creazione Namespace (Per Test Decap/Encap)
+###### 2. Creazione Namespace (Per Test Decap/Encap)
 
-Esegui lo script di setup (`scripts/setup_netns.sh`) per creare la topologia a namespace (`gnb`, `dn`) e le coppie veth. È necessario abilitare `accept_local=1` sull'interfaccia `veth-n6` per instradare i pacchetti con IP sorgente manipolato da XDP.
+Esegui lo script di setup (`scripts/setup_netns.sh`) per creare la topologia a namespace (`gnb`, `dn`) e le coppie `veth`. È necessario abilitare `accept_local=1` sull'interfaccia `veth-n6` per instradare i pacchetti con IP sorgente manipolato da XDP.
 
-##### 3. Esecuzione
+###### 3. Esecuzione
 
-Avvia il manager (user-space) sull'interfaccia collegata alla rete radio (es. `veth-n3`) o core (`veth-n6`). Utilizzerà automaticamente la modalità *SKB (Generic XDP)*.
+Avvia il manager (user-space) sull'interfaccia collegata alla rete radio (es. `veth-n3`) o core (`veth-n6`). Utilizzerà automaticamente la modalità *Default*.
 
 ```
 cargo run --release -- --iface veth-n3
@@ -110,9 +117,9 @@ cargo run --release -- --iface veth-n3
 RUST_LOG=info cargo run --release -- --iface veth-n6
 ```
 
-##### 4. Test del traffico Uplink, Downlink e Rate Limiting
+###### 4. Test del traffico Uplink e Downlink
 
-In terminali separati, usa gli script Python con Scapy per testare decapsulazione, incapsulazione e il policing QoS, intercettando l'esito tramite tcpdump.
+In terminali separati, usa gli script Python con Scapy per testare decapsulazione e incapsulazione, intercettando l'esito tramite tcpdump.
 
 **Test Uplink (Decap):**
 
@@ -120,7 +127,7 @@ In terminali separati, usa gli script Python con Scapy per testare decapsulazion
 sudo ip netns exec gnb python3 scripts/netns_decap_test.py
 ```
 
-**Test Downlink e QoS (Encap):**
+**Test Downlink  e QoS (Encap):**
 
 ```
 sudo ip netns exec dn python3 scripts/netns_encap_test.py
@@ -129,7 +136,7 @@ sudo ip netns exec dn python3 scripts/netns_qos_dl_test.py
 
 *(Verifica l'inserimento dell'header tramite: `sudo ip netns exec gnb tcpdump -i veth-gnb -n -vv -X udp port 2152`)*
 
-#### 🛣️ Roadmap e Prossimi Sviluppi
+###### 🛣️ Roadmap e Prossimi Sviluppi
 
 * \[x\] Parsing base GTP-U in XDP ed eventi verso userspace.
 
@@ -141,16 +148,14 @@ sudo ip netns exec dn python3 scripts/netns_qos_dl_test.py
 
 * \[x\] Statistiche basate sui flussi QoS (QFI).
 
-* \[x\] **Rifattorizzazione Modulare e Ottimizzazione Asincrona (Tokio AsyncRingBuf).**
+* \[x\] Rifattorizzazione Modulare e Ottimizzazione Asincrona (Tokio AsyncRingBuf).
 
-* \[x\] **Decapsulazione Uplink:** Rimozione dinamica dell'header esterno tramite `bpf_xdp_adjust_head`, re-inoltro e validazione IP interno (`CNT_ERR_INNER_IP`).
+* \[x\] Decapsulazione Uplink: Rimozione dinamica dell'header esterno tramite `bpf_xdp_adjust_head`, re-inoltro e validazione IP interno (`CNT_ERR_INNER_IP`).
 
-* \[x\] **Incapsulazione Downlink:** Implementato il percorso inverso con calcolo del checksum IPv4.
+* \[x\] Incapsulazione Downlink: Implementato il percorso inverso con calcolo del checksum IPv4.
 
-* \[x\] **Inserimento dinamico del QFI:** Scrittura del *PDU Session Container* nell'header incapsulato tramite Lookup QER in Downlink.
+* \[x\] Inserimento dinamico del QFI: Scrittura del *PDU Session Container* nell'header incapsulato tramite Lookup QER.
 
-* \[x\] **Rate Limiting (QoS Policing):** Implementazione logiche QER per far rispettare il Maximum Bit Rate (MBR) tramite algoritmo **GCRA lock-free su base Per-CPU** (UL e DL).
+* \[x\] **Implementazione logiche QER (QoS Enforcement Rule) per il Rate Limiting** tramite architettura trTCM (Dual GCRA Per-CPU).
 
-* \[ \] Integrazione con un control plane dinamico in user-space (CLI/API) per inserimento regole a runtime.
-
-* \[ \] (Opzionale) Implementazione instradamento accelerato bypassando lo stack di rete tramite `XDP_REDIRECT` e `bpf_fib_lookup`.
+* \[ \] Integrazione con un control plane (es. PFCP) per modifiche dinamiche a runtime.
