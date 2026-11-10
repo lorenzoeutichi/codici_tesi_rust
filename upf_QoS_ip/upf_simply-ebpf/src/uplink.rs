@@ -4,7 +4,7 @@ use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
     CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
 };
-use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count, count_qfi}, net::{parse_ipv4, ptr_at, ptr_at_mut}};
+use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count, count_qfi}, net::{ptr_at, ptr_at_mut}};
 
 
 #[inline(always)]
@@ -39,9 +39,9 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
             }
             Some(far) => match far.action {
                 FAR_FORWARD => {
-                    let ip_length = parse_ipv4(ctx, gtp.payload_offset)?.total_length;
-                    info!(ctx, "lunghezza pkt ip interno: {}", ip_length);
-                    if police_ul(pdr.qer_id, ip_length).is_err() { // gli devo passa la lunghezza del pkt ip 
+                    let inner_ip_pkt: *mut Ipv4Hdr = ptr_at_mut(ctx, gtp.payload_offset)?;
+                    info!(ctx, "lunghezza pkt ip interno: {}", unsafe { (*inner_ip_pkt).tot_len()});
+                    if police_ul(pdr.qer_id, inner_ip_pkt).is_err() { // gli devo passa la lunghezza del pkt ip 
                         count(CNT_DROP_QOS);
                         return Ok(XDP_DROP);
                     }
@@ -64,7 +64,7 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
 }
 
 #[inline(always)]
-fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
+fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count(CNT_NO_QER);
@@ -81,6 +81,7 @@ fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
                         return Ok(XDP_PASS);
                     }
                     let now = unsafe {bpf_ktime_get_ns() };
+                    let ip_tot_length = unsafe {(*ip_pkt).tot_len()};
                     let cost_ip_pkt_p = (ip_tot_length as u64 * qer.pir_ul.ns_per_byte) >> 30; // calcolo costo di picco
                     let cost_ip_pkt_c = (ip_tot_length as u64 * qer.cir_ul.ns_per_byte) >> 30; // calcolo costo garantito
 
@@ -99,9 +100,12 @@ fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
                         return Err(()); // Supera il burst: Drop QoS
                     }
                     // Condizione GIALLO
-                    else if new_tat_pir - now > qer.pir_ul.burst_tolerance_ns {
+                    else if new_tat_cir - now > qer.cir_ul.burst_tolerance_ns {
                         // superamento del CIR, ma non del PIR
-                        unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir; }
+                        unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir;
+                                (*ip_pkt).set_tos(14, 0); // AF13
+                                (*ip_pkt).set_checksum(0);
+                                (*ip_pkt).set_checksum(checksum_ipv4hdr(ip_pkt)); }                        
                         return Ok(XDP_PASS)
                     } 
                     // Condizione VERDE
@@ -116,6 +120,18 @@ fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
     }
 }
 
+
+fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
+    let mut conta: u32 = 0;
+    let vec_ip_hdr =  ip_hdr as *const [u16; 10];
+    for i in 0..10 {
+        conta += unsafe { (*vec_ip_hdr)[i] as u32};
+    }
+    // somma dei vari riporti nei primi 16 bit
+    conta = (conta >> 16) + (conta & 0xFFFF); // tale somma potrebbe creare un ulteriore riporto
+    conta = (conta >> 16) + (conta & 0xFFFF); 
+    return u16::to_be(!(conta as u16)); //dato che la somma lavora con valori già in Network Order
+}
 
 #[inline(always)]
 fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32, u32> {

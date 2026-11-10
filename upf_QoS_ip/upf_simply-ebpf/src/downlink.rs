@@ -29,12 +29,16 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                 None => return Err(CNT_NO_FAR),
                 Some(far) => match far.action {
                     FAR_FORWARD => {
-                        if police_dl(ctx,pdr.qer_id, ip.total_length).is_err() {
-                            count(CNT_DROP_QOS);
-                            return Ok(XDP_DROP)
-                        }
+                        
+                        let is_yellow = match police_dl(pdr.qer_id, ip.total_length) {
+                            Ok(yellow_flag) => yellow_flag,
+                            Err(_) => {
+                                count(CNT_DROP_QOS);
+                                return Ok(XDP_DROP)
+                            } 
+                        };
                         if far.outer_hdr_creation == 1 {
-                            return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi)
+                            return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi, is_yellow)
                         }
                         count(CNT_FORWARD);
                     }
@@ -51,22 +55,23 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 }
 
 #[inline(always)]
-fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
+fn police_dl(qer_id: u32, ip_tot_length: u16) -> Result<bool, ()> {
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count(CNT_NO_QER);
-            return Ok(XDP_PASS);
+            return Ok(false);
         }
         Some(qer) => {
 
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count(CNT_NO_QER);
-                    return Ok(XDP_PASS) }
+                    return Ok(false) }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
-                        return Ok(XDP_PASS);
+                        return Ok(false);
                     }
+                    
                     let now = unsafe {bpf_ktime_get_ns() };
                     let cost_ip_pkt_p = (ip_tot_length as u64 * qer.pir_dl.ns_per_byte) >> 30;
                     let cost_ip_pkt_c = (ip_tot_length as u64 * qer.cir_dl.ns_per_byte) >> 30;
@@ -88,13 +93,13 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
                     // Condizione GIALLO
                     else if new_tat_cir - now > qer.cir_dl.burst_tolerance_ns {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
-                        return Ok(XDP_PASS);
+                        return Ok(true);
                     }
                     // Condizione VERDE
                     else {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
                         unsafe { (*ptr_qer).tat_cir_dl = new_tat_cir; }
-                        return Ok(XDP_PASS);
+                        return Ok(false);
                     }
                 }
             }
@@ -104,9 +109,9 @@ fn police_dl(ctx: &XdpContext, qer_id: u32, ip_tot_length: u16) -> Result<u32, (
 
 
 #[inline(always)]
-fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8) -> Result<u32, u32> {
+fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8, is_yellow: bool) -> Result<u32, u32> {
     let add_hdr: i32 = 44;  // escluso l'eth hdr (ip + udp + gtp-u + ext hdr)
-    info!(ctx, "DL Encap: IP total_length estratta = {}", total_length as u32);
+    info!(ctx, "DL Encap: IP total length estratta = {}", total_length as u32);
     if total_length + (add_hdr as u16) > 1500 {
         info!(ctx, "MTU standard (1500 byte) superato");
         return Err(CNT_ERR);
@@ -123,7 +128,8 @@ fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: E
     unsafe {
         // le funzioni set convertono automaticamente in Network Order 
         (*ip_hdr).set_vihl(4, 20);
-        (*ip_hdr).set_tos(0, 0);
+        let dscp_value = if is_yellow {14} else {0}; // AF13
+        (*ip_hdr).set_tos(dscp_value, 0);
         (*ip_hdr).set_tot_len(total_length + add_hdr as u16);
         (*ip_hdr).set_id(0);
         (*ip_hdr).ttl = 64;
