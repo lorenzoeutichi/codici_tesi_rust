@@ -10,17 +10,90 @@ use upf_simply_common::{
     BucketParam, CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
+use std::process::Command;
 
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(short, long, default_value = "eth0")]
-    iface: String,
+    iface_in: String,
+    #[clap(short, long)]
+    iface_out: String,
+    #[clap(short, long)]
+    mbr: u64,
+    #[clap(short, long)]
+    gbr: u64,
+
+}
+
+// funzione che invoca i comandi TC
+fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64) -> anyhow::Result<()> {
+    let mbr_bps = mbr * 1_000_000;
+    let gbr_bpr = gbr * 1_000_000;
+    println!("Configurazione Traffic Control (HTB Shaper) su {} (MBR: {} Mbps, GBR: {} Mbps)...", iface, mbr, gbr);
+
+    // Formattazione per tc (es. "100000000bit")
+    let mbr_str = format!("{}bit", mbr_bps);
+    let gbr_str = format!("{}bit", gbr_bpr);
+    
+    // Assegniamo una rate minima di sussistenza alla coda Gialla (es. 1% dell'MBR) 
+    // per rispettare i vincoli di HTB senza rubare banda al GBR.
+    let base_yellow_rate = std::cmp::max(mbr_bps / 100, 1000); 
+    let excess_str = format!("{}bit", base_yellow_rate);
+
+    let commands = [
+        format!("tc qdisc del dev {} root", iface),
+        format!("tc qdisc add dev {} root handle 1: htb default 20", iface),
+        
+        // Classe Padre limitata all'MBR globale
+        format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {}", iface, mbr_str, mbr_str),
+        
+        // Coda Verde (1:10) - Banda Garantita pari al GBR
+        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b", iface, gbr_str, mbr_str),
+        
+        // Coda Gialla (1:20) - Banda base minima, tetto pari all'MBR
+        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b", iface, excess_str, mbr_str),
+        
+        // format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
+        // format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
+        // Sotto-code FIFO rigidissime per forzare il Tail Drop
+        // Coda verde limitata a 10 pacchetti
+        format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 10", iface),
+        // Coda gialla limitata a soli 2 pacchetti (innesco drop istantaneo)
+        format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 2", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x00 0xff flowid 1:10", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xff flowid 1:20", iface),
+    ];
+
+    for cmd_str in commands.iter() {
+        // Separa il comando base dagli argomenti
+        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
+        let status = Command::new(parts[0])
+            .args(&parts[1..])
+            .status();
+        
+        // Ignoriamo intenzionalmente l'errore del primo comando (pulizia) 
+        // nel caso la qdisc non esista ancora.
+        if let Ok(st) = status {
+            if !st.success() && !cmd_str.contains("del dev") {
+                eprintln!("Attenzione: Comando TC fallito: {}", cmd_str);
+            }
+        } else if !cmd_str.contains("del dev") {
+            eprintln!("Errore nell'esecuzione del comando TC: {}", cmd_str);
+        }
+    }
+
+    println!("Traffic Control configurato con successo.");
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 
     let opt = Opt::parse();
+    let Opt { iface_in,
+            iface_out ,
+            mbr ,
+            gbr,} = opt;
     env_logger::init();
     
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -101,8 +174,8 @@ async fn main() -> anyhow::Result<()> {
     };
     
     // --- DEFINIZIONE PARAMETRI GLOBALI FLUSSO (Dal Control Plane) ---
-    let mbr_bps = 100_000; 
-    let gbr_bps = 5_000;
+    let mbr_bps = mbr * 1_000_000; // in bit/s
+    let gbr_bps = gbr * 1_000_000;
     let burst_mbr_bytes= 1500;
     let burst_gbr_bytes = 1500;
     // Calcola quante code hardware/CPU stanno elaborando il traffico
@@ -140,11 +213,14 @@ async fn main() -> anyhow::Result<()> {
     qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?, 0)?; // downlink
     // qer_state_map.insert(2, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
 
-    let Opt { iface } = opt;
+    
     let program: &mut Xdp = ebpf.program_mut("upf_simply").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpMode::default())
+    program.attach(&iface_in, XdpMode::default())
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
+
+    // lo shaper va messo sull'interfaccia di USCITA del tunnel
+    let _ = setup_tc_shaper(&iface_out, mbr, gbr);
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
 
@@ -170,9 +246,12 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 if last_print.elapsed() >= Duration::from_secs(5) {
-                    println!("---NEW REPORT----");
+                    println!("---XDP POLICING REPORT----");
                     let _ = print_qfi(&qfi_counters);
                     let _ = print_counters(&counters);
+
+                    println!("\n--- TC SHAPING REPORT ---");
+                    let _ = print_tc_stats(&iface_out);
                     println!("-----------");
                     last_print = tokio::time::Instant::now();
                 }  
@@ -182,6 +261,7 @@ async fn main() -> anyhow::Result<()> {
     println!("---FINAL REPORT----");
     let _ = print_qfi(&qfi_counters);
     let _ = print_counters(&counters);
+    let _ = print_tc_stats(&iface_out);
     println!("-----------");
     Ok(())
 }
@@ -218,4 +298,20 @@ fn print_qfi(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_tc_stats(iface: &str) {
+    if let Ok(output) = std::process::Command::new("tc")
+        .args(["-s", "class", "show", "dev", iface])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        println!("--- STATISTICHE TC SHAPER (HTB) ---");
+        // Filtriamo le righe vuote per mantenere il terminale pulito
+        for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+            println!("{}", line);
+        }
+    } else {
+        println!("Impossibile recuperare le statistiche TC per {}", iface);
+    }
 }

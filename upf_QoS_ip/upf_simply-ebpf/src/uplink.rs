@@ -120,7 +120,6 @@ fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
     }
 }
 
-
 fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
     let mut conta: u32 = 0;
     let vec_ip_hdr =  ip_hdr as *const [u16; 10];
