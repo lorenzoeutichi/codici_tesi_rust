@@ -140,17 +140,16 @@ sudo ip netns exec gnb python3 scripts/netns_qos_test.py
 
 *(Nel terminale principale potrai osservare i drop QoS rossi operati da XDP e, in caso di congestione della classe `1:20`, i drop gialli operati dal kernel Linux HTB).*
 
-**\*\*Test Downlink  e QoS (Encap):\*\***
+**Test Downlink  e QoS (Encap):**
 
-\`\`\`
 
+```
 sudo ip netns exec dn python3 scripts/netns_encap_test.py
 
 sudo ip netns exec dn python3 scripts/netns_qos_dl_test.py
+```
 
-\`\`\`
-
-*\*(Verifica l'inserimento dell'header tramite: \`sudo ip netns exec gnb tcpdump -i veth-gnb -n -vv -X udp port 2152\`)\**
+*(Verifica l'inserimento dell'header tramite: \`sudo ip netns exec gnb tcpdump -i veth-gnb -n -vv -X udp port 2152\`)*
 
 ## 🛣️ Roadmap e Traguardi
 
