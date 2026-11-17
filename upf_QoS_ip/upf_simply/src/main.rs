@@ -22,11 +22,13 @@ struct Opt {
     mbr: u64,
     #[clap(short, long)]
     gbr: u64,
+    #[clap(long, default_value_t = 0)]
+    strip_bytes: u32,   // byte da non contare nell'HTB: 14 in UL, 58 in DL
 
 }
 
 // funzione che invoca i comandi TC
-fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64) -> anyhow::Result<()> {
+fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow::Result<()> {
     let mbr_bps = mbr * 1_000_000;
     let gbr_bpr = gbr * 1_000_000;
     println!("Configurazione Traffic Control (HTB Shaper) su {} (MBR: {} Mbps, GBR: {} Mbps)...", iface, mbr, gbr);
@@ -42,24 +44,28 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64) -> anyhow::Result<()> {
 
     let commands = [
         format!("tc qdisc del dev {} root", iface),
-        format!("tc qdisc add dev {} root handle 1: htb default 20", iface),
+        if strip_bytes > 0 {
+            format!("tc qdisc add dev {} root handle 1: stab overhead -{} linklayer ethernet htb default 20",
+            iface, strip_bytes)
+        } else {
+            format!("tc qdisc add dev {} root handle 1: htb default 20", iface)
+        },
         
         // Classe Padre limitata all'MBR globale
-        format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {}", iface, mbr_str, mbr_str),
+        format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {} burst 15000b cburst 15000b", iface, mbr_str, mbr_str),
         
         // Coda Verde (1:10) - Banda Garantita pari al GBR
-        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b", iface, gbr_str, mbr_str),
+        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b cburst 15000b", iface, gbr_str, mbr_str),
         
         // Coda Gialla (1:20) - Banda base minima, tetto pari all'MBR
-        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b", iface, excess_str, mbr_str),
+        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b", iface, excess_str, mbr_str),
         
         // format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
         // format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
         // Sotto-code FIFO rigidissime per forzare il Tail Drop
-        // Coda verde limitata a 10 pacchetti
-        format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 10", iface),
-        // Coda gialla limitata a soli 2 pacchetti (innesco drop istantaneo)
-        format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 2", iface),
+        format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 100", iface),
+        format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 100", iface),
+
         format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x00 0xff flowid 1:10", iface),
         format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xff flowid 1:20", iface),
     ];
@@ -93,7 +99,8 @@ async fn main() -> anyhow::Result<()> {
     let Opt { iface_in,
             iface_out ,
             mbr ,
-            gbr,} = opt;
+            gbr,
+            strip_bytes} = opt;
     env_logger::init();
     
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -176,15 +183,16 @@ async fn main() -> anyhow::Result<()> {
     // --- DEFINIZIONE PARAMETRI GLOBALI FLUSSO (Dal Control Plane) ---
     let mbr_bps = mbr * 1_000_000; // in bit/s
     let gbr_bps = gbr * 1_000_000;
-    let burst_mbr_bytes= 1500;
-    let burst_gbr_bytes = 1500;
+    let burst_mbr_bytes= 15000;
+    let burst_gbr_bytes = 15000;
     // Calcola quante code hardware/CPU stanno elaborando il traffico
     let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64;
+    let cpu_div = 1;
     // --- PARTIZIONE PER-CPU ---
-    let mbr_bps_per_cpu = mbr_bps / num_cpus;
-    let gbr_bps_per_cpu = gbr_bps / num_cpus;
-    let burst_mbr_per_cpu = burst_mbr_bytes / num_cpus;
-    let burst_gbr_per_cpu = burst_gbr_bytes / num_cpus;
+    let mbr_bps_per_cpu = mbr_bps / cpu_div;
+    let gbr_bps_per_cpu = gbr_bps / cpu_div;
+    let burst_mbr_per_cpu = burst_mbr_bytes;
+    let burst_gbr_per_cpu = burst_gbr_bytes;
 
     // MAPPA QER
     let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
@@ -194,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
             ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
         pir_ul: BucketParam { 
             ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
-        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }}, 0)?;
+        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, 
+        pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }},
+        0)?;
     
     qer_map.insert(2, Qer {
         qfi: 5, 
@@ -202,7 +212,10 @@ async fn main() -> anyhow::Result<()> {
             ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
         pir_ul: BucketParam { 
             ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
-        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }}, 0)?;
+        cir_dl: BucketParam { ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) }, 
+        pir_dl: BucketParam { ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) }},
+         0)?;
+
     // qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
     // qer_map.insert(2, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
 
@@ -220,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
     // lo shaper va messo sull'interfaccia di USCITA del tunnel
-    let _ = setup_tc_shaper(&iface_out, mbr, gbr);
+    let _ = setup_tc_shaper(&iface_out, mbr, gbr, strip_bytes);
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
 
