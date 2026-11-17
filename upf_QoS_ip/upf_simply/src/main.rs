@@ -39,7 +39,7 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow:
     
     // Assegniamo una rate minima di sussistenza alla coda Gialla (es. 1% dell'MBR) 
     // per rispettare i vincoli di HTB senza rubare banda al GBR.
-    let base_yellow_rate = std::cmp::max(mbr_bps / 100, 1000); 
+    let base_yellow_rate = std::cmp::max(mbr_bps / 100, 1000);
     let excess_str = format!("{}bit", base_yellow_rate);
 
     let commands = [
@@ -60,11 +60,12 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow:
         // Coda Gialla (1:20) - Banda base minima, tetto pari all'MBR
         format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b", iface, excess_str, mbr_str),
         
-        // format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
-        // format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
+        // Classi foglia fq_codel per assicurare che il traffico consentito venga consegnato con la massima equità e la minima latenza possibile.
+        format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
         // Sotto-code FIFO rigidissime per forzare il Tail Drop
-        format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 100", iface),
-        format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 100", iface),
+        // format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 100", iface),
+        // format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 100", iface),
 
         format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x00 0xff flowid 1:10", iface),
         format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xff flowid 1:20", iface),
