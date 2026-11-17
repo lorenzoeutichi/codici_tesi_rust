@@ -28,7 +28,7 @@ Gli eventi GTP-U vengono inviati allo userspace tramite `RingBuf`, mentre le sta
 
   La burst tolerance include il costo del pacchetto corrente, quindi deve essere almeno pari al pacchetto più grande: il progetto usa **15000 B** per CIR e PIR.
 
-* **Traffic Control (TC) Shaping (HTB & pfifo):** il control-plane istanzia automaticamente un albero `qdisc` HTB sull'interfaccia di egress, con filtri `u32` sul TOS impostato da XDP:
+* **Traffic Control (TC) Shaping (HTB & fq_codel):** il control-plane istanzia automaticamente un albero `qdisc` HTB sull'interfaccia di egress, con filtri `u32` sul TOS impostato da XDP:
 
   * **Root `1:1`:** `rate = ceil = MBR`.
 
@@ -36,7 +36,7 @@ Gli eventi GTP-U vengono inviati allo userspace tramite `RingBuf`, mentre le sta
 
   * **Coda Gialla `1:20`:** `rate` pari all'1% dell'MBR, `ceil = MBR`; è anche la classe di default per i pacchetti con TOS non riconosciuto.
 
-  * Le code foglia sono `pfifo`; il loro limite determina quanti pacchetti vengono scartati dal TC in caso di micro-burst (valori troppo bassi falsano le misure di rate).
+  * Le code foglia sono `fq_codel`; 
 
 * **HTB che misura solo l'IP interno:** il policer XDP conta l'IP interno, mentre l'HTB conta di default tutto il frame (Ethernet e, in DL, anche l'outer header da 44 B). L'opzione `--strip-bytes N` installa sulla qdisc root una size table `stab overhead -N`, così l'HTB e il policer misurano la stessa grandezza. Valori: **14** in uplink (Ethernet), **58** in downlink (Ethernet + IP + UDP + GTP-U + campi opzionali + extension header). Con `--strip-bytes 0` si ottiene l'HTB standard.
 
