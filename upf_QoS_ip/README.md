@@ -14,7 +14,7 @@ Gli eventi GTP-U vengono inviati allo userspace tramite `RingBuf`, mentre le sta
 
 * **Parsing XDP e Gestione Errori Unificata:** Validazione della catena Ethernet → IPv4 → UDP → GTP-U v1. Gli errori sono mappati direttamente in contatori specifici tramite l'uso idiomatico di `Result<T, u32>`.
 
-* **Decapsulazione Uplink & Incapsulazione Downlink:** Rimozione e iniezione dinamica di header (IPv4, UDP, GTP-U ed Extension Headers) con ricalcolo del checksum IPv4 dell'header esterno. In downlink l'IP interno può essere lungo al massimo **1456 B** (outer = 1500 B): oltre, il pacchetto non viene incapsulato e incrementa il contatore di errore.
+* **Decapsulazione Uplink & Incapsulazione Downlink:** Rimozione e aggiunta dinamica di header (IPv4, UDP, GTP-U ed Extension Headers) con ricalcolo del checksum IPv4 dell'header esterno. In downlink l'IP interno può essere lungo al massimo **1456 B** (outer = 1500 B): oltre, il pacchetto non viene incapsulato e incrementa il contatore di errore.
 
 * **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink), anche con catene di più extension header, ed emissione in uscita (Downlink) del container `0x85` con il **QFI** (QoS Flow Identifier) letto dalla QER.
 
@@ -127,8 +127,7 @@ cargo build --release
 
 ### 2. Creazione Namespace (Topologia di Test)
 
-Esegui `scripts/setup_netns.sh` per creare i namespace (`ns-gnb`, `ns-dn`) e le coppie `veth`. Sull'UPF servono `ip_forward=1` e le rotte verso `10.0.3.2` (via `veth-n3`) e `10.0.6.2` (via `veth-n6`). Se in downlink l'encap risulta nei contatori ma al gNB non arriva nulla, l'outer header ha come sorgente un IP locale dell'UPF: prova `rp_filter=0` e `accept_local=1` su `veth-n6`.
-
+Esegui `scripts/setup_netns.sh` per creare i namespace (`ns-gnb`, `ns-dn`) e le coppie `veth`.
 ### 3. Esecuzione del Control Plane (User Space)
 
 Parametri: interfaccia di ingresso, interfaccia di uscita (dove si installa lo shaper), MBR e GBR in **Mbps**, e `--strip-bytes` (byte non contati dall'HTB). Il GBR deve essere minore dell'MBR (con GBR + 1% MBR ≤ MBR, per il vincolo HTB sulle classi figlie) e con rate oltre ~100 Mbps l'HTB segnala un quantum troppo grande.
@@ -171,7 +170,7 @@ Passare `--htb-overhead 0` dice agli script che l'HTB conta solo l'IP interno (c
 
 | Fase | Verifica |
 | ----- | ----- |
-| 1. Funzionale | UL: parsing e decap con flag `0x30`/`0x32`/`0x34` e catena di extension header, TEID in drop e senza PDR. DL: ogni campo dell'outer header (checksum, lunghezze, TEID, QFI), pacchetto interno identico, limite MTU, UE senza PDR |
+| 1. Funzionale | UL: parsing e decap con flag `0x30`/`0x32`/`0x34` e catena di extension header, TEID in drop e senza PDR.  DL: ogni campo dell'outer header (checksum, lunghezze, TEID, QFI), pacchetto interno identico, limite MTU, UE senza PDR |
 | 2. Sweep di rate | Uscita ≈ min(offerto, MBR); quota di verde ≈ min(offerto, GBR) / min(offerto, MBR), letta dal TOS dei pacchetti e dai contatori delle classi HTB |
 | 3. Dimensione pacchetto | Con carico oltre l'MBR l'uscita resta ≈ MBR per IP interno da 100, 500, 1000 e 1400 B |
 | 4. Burst | Dopo quiete passano circa `burst + MBR × tempo di invio` byte |
