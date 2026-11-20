@@ -938,6 +938,8 @@ dependencies = [
  "futures",
  "libc",
  "log",
+ "serde",
+ "serde_json",
  "tokio",
  "upf_simply-common",
  "upf_simply-ebpf",

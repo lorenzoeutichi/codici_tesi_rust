@@ -1,16 +1,23 @@
-use anyhow::Context as _;
+use anyhow::{Context as _};
 use aya::{maps::PerCpuHashMap, programs::{Xdp, XdpMode}};
 use aya::util::nr_cpus;
 use clap::Parser;
 #[rustfmt::skip]
 use log::{warn};
-use tokio::{signal, sync::mpsc, time::Instant};
-use aya::maps::{RingBuf, HashMap, PerCpuArray, PerCpuValues};
+use tokio::{net::UdpSocket, signal, sync::mpsc, time::Instant};
+use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    BucketParam, CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_DROP, FAR_FORWARD, Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, 
+    Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+mod control;
+use crate::control::{ControlState, FarAction::{Drop, Forward}, apply_command, run_control_plane};
+
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -24,6 +31,8 @@ struct Opt {
     gbr: u64,
     #[clap(long, default_value_t = 0)]
     strip_bytes: u32,   // byte da non contare nell'HTB: 14 in UL, 58 in DL
+    #[clap(short, long, default_value = "127.0.0.1:8805")]
+    cp_addr: String,
 
 }
 
@@ -93,6 +102,7 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow:
     Ok(())
 }
 
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 
@@ -101,7 +111,8 @@ async fn main() -> anyhow::Result<()> {
             iface_out ,
             mbr ,
             gbr,
-            strip_bytes} = opt;
+            strip_bytes,
+            cp_addr,} = opt;
     env_logger::init();
     
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -147,87 +158,48 @@ async fn main() -> anyhow::Result<()> {
 
         }
     });
-    // MAPPA UL-PDR
-    let mut ul_pdr_map: HashMap<_, u32, Pdr> = HashMap::try_from(ebpf.map_mut("UL_PDR_MAP").unwrap())?;
-    ul_pdr_map.insert(9999, Pdr { far_id: 1, outer_hdr_removed: 1, qer_id: 1, _pad: [0;3]}, 0)?;
-    ul_pdr_map.insert(8888, Pdr { far_id: 2, outer_hdr_removed: 1, qer_id: 0, _pad: [0;3]}, 0)?;
 
-    // MAPPA DL-PDR
-    let mut dl_pdr_map: HashMap<_, u32, Pdr> = HashMap::try_from(ebpf.map_mut("DL_PDR_MAP").unwrap())?;
-    dl_pdr_map.insert(Ipv4Addr::new(10, 60, 0, 1).to_bits(), Pdr{ far_id: 3, qer_id: 2, outer_hdr_removed: 0, _pad: [0;3]}, 0)?;
+    let qer_state_map: Arc<Mutex<PerCpuHashMap<_, u32, QerState>>> =
+        Arc::new(Mutex::new(PerCpuHashMap::try_from(ebpf.take_map("QER_STATE_MAP").unwrap())?));
+    let qer_map: Arc<Mutex<HashMap<_, u32, Qer>>> = Arc::new(Mutex::new(HashMap::try_from(ebpf.take_map("QER_MAP").unwrap())?));
+    let far_map: Arc<Mutex<HashMap<_, u32, Far>>> = Arc::new(Mutex::new(HashMap::try_from(ebpf.take_map("FAR_MAP").unwrap())?));
+    let ul_pdr_map: Arc<Mutex<HashMap<_, u32, Pdr>>> = Arc::new(Mutex::new(HashMap::try_from(ebpf.take_map("UL_PDR_MAP").unwrap())?));
+    let dl_pdr_map: Arc<Mutex<HashMap<_, u32, Pdr>>> = Arc::new(Mutex::new(HashMap::try_from(ebpf.take_map("DL_PDR_MAP").unwrap())?));
     
-    // MAPPA FAR
-    let mut far_map: HashMap<_, u32, Far> = HashMap::try_from(ebpf.map_mut("FAR_MAP").unwrap())?;
-    far_map.insert(1, Far { action: FAR_FORWARD, outer_hdr_creation: 0, _pad: [0;2], peer_ip: 0, peer_teid: 0, local_ip: 0}, 0)?;
-    far_map.insert(2, Far { action: FAR_DROP, outer_hdr_creation: 0, _pad: [0;2], peer_ip: 0, peer_teid: 0, local_ip: 0}, 0)?;
-    far_map.insert(3, Far { action: FAR_FORWARD, outer_hdr_creation: 1, _pad: [0; 2],
-                                        peer_ip: Ipv4Addr::new(10, 0, 3, 2).to_bits(), peer_teid: 7001,
-                                        local_ip: Ipv4Addr::new(10, 0, 3, 1).to_bits() }, 0)?;
-
-    // Calcolo del MBR scalato (Byte/s) per Token Bucket
-    // let calc_mbr_scaled = |bits_per_sec: u64| -> u64 {
-    //     ((bits_per_sec / 8) << 30) / 1_000_000_000
-    // };
-
-    // 1. Calcolo del costo temporale (in nanosecondi) di un byte
-    let calc_ns_per_byte_scaled = |bits_per_sec: u64| -> u64 {
-        if bits_per_sec == 0 { return 0; } // Gestione dei flussi non-QoS
-        let bytes_per_sec = bits_per_sec / 8;
-    // Moltiplica 1 secondo (10^9 ns) per 2^30 prima di dividere per i Byte/s
-        (1_000_000_000u64 << 30) / bytes_per_sec
-    };
-    // 2. Calcolo della tolleranza di burst in nanosecondi 
-    let calc_burst_tolerance_ns = |bits_per_sec: u64, burst_bytes: u64| -> u64 {
-        burst_bytes * calc_ns_per_byte_scaled(bits_per_sec) >> 30
-    };
-    
-    // --- DEFINIZIONE PARAMETRI GLOBALI FLUSSO (Dal Control Plane) ---
-    let mbr_bps = mbr * 1_000_000; // in bit/s
-    let gbr_bps = gbr * 1_000_000;
-    let burst_mbr_bytes= 15000;
-    let burst_gbr_bytes = 15000;
-    // Calcola quante code hardware/CPU stanno elaborando il traffico
-    let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64;
+    let num_cpus = nr_cpus().expect("Impossibile determinare il numero di CPU") as u64; // Calcola quante code hardware/CPU stanno elaborando il traffico
     let cpu_div = 1;
-    // --- PARTIZIONE PER-CPU ---
-    let mbr_bps_per_cpu = mbr_bps / cpu_div;
-    let gbr_bps_per_cpu = gbr_bps / cpu_div;
-    let burst_mbr_per_cpu = burst_mbr_bytes;
-    let burst_gbr_per_cpu = burst_gbr_bytes;
+    let list_maps = ControlState {
+        ul_pdr_map,
+        dl_pdr_map,
+        far_map,
+        qer_map,
+        qer_state_map,
+        num_cpus,
+        cpu_div,
 
-    // MAPPA QER
-    let mut qer_map = HashMap::try_from(ebpf.map_mut("QER_MAP").unwrap())?;
-    qer_map.insert(1, Qer {
-        qfi: 5, 
-        cir_ul: BucketParam { 
-            ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
-        pir_ul: BucketParam { 
-            ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
-        cir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }, 
-        pir_dl: BucketParam { ns_per_byte: 0, burst_tolerance_ns: 0 }},
-        0)?;
+    };
     
-    qer_map.insert(2, Qer {
-        qfi: 5, 
-        cir_ul: BucketParam { 
-            ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) },
-        pir_ul: BucketParam { 
-            ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) },
-        cir_dl: BucketParam { ns_per_byte: calc_ns_per_byte_scaled(gbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(gbr_bps_per_cpu, burst_gbr_per_cpu) }, 
-        pir_dl: BucketParam { ns_per_byte: calc_ns_per_byte_scaled(mbr_bps_per_cpu), burst_tolerance_ns: calc_burst_tolerance_ns(mbr_bps_per_cpu, burst_mbr_per_cpu) }},
-         0)?;
+    // REGOLE UPLINK
+    let _ = apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 9999, far_id: 1, far_action: Forward, outer_hdr_removed: true,
+                                                                            qos: Some(control::QosParams {
+                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) });
+    let _ = apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 8888, far_id: 2, far_action: Drop, outer_hdr_removed: true,
+                                                                            qos: None });
+    // REGOLA IN DOWNLINK
+    let _ = apply_command(&list_maps, control::ControlCommand::AddDownlink { ue_ip: Ipv4Addr::new(10, 60, 0, 1), far_id: 3, far_action: Forward,
+                                                                                peer_ip: Ipv4Addr::new(10, 0, 3, 2), peer_teid: 7001,
+                                                                                local_ip: Ipv4Addr::new(10, 0, 3, 1), outer_hdr_creation: true, 
+                                                                                qos: Some(control::QosParams { 
+                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) });
 
-    // qer_map.insert(1, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
-    // qer_map.insert(2, Qer {qfi: 5, _pad: [0; 7], mbr_dl_scaled: calc_mbr_scaled(400), mbr_ul_scaled: calc_mbr_scaled(400), burst_dl: 100, burst_ul: 100}, 0)?;
+
+    let socket = UdpSocket::bind(cp_addr).await?;
+    let list_map_cp = list_maps.clone();
+    let _control_plane = tokio::spawn(async move {
+        run_control_plane(socket, list_map_cp).await
+    });
 
 
-    // MAPP QER-STATE
-    let mut qer_state_map: PerCpuHashMap<&mut aya::maps::MapData, u32, QerState> = PerCpuHashMap::try_from(ebpf.map_mut("QER_STATE_MAP").unwrap())?;
-    qer_state_map.insert(1, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?, 0)?; // uplink
-    qer_state_map.insert(2, PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?, 0)?; // downlink
-    // qer_state_map.insert(2, QerState { last_update_dl: 0, last_update_ul: 0, tokens_dl: 80 , tokens_ul: 0}, 0)?; // downlink
-
-    
     let program: &mut Xdp = ebpf.program_mut("upf_simply").unwrap().try_into()?;
     program.load()?;
     program.attach(&iface_in, XdpMode::default())
