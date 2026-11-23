@@ -1,8 +1,8 @@
 use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{bpf_ktime_get_ns, bpf_xdp_adjust_head}, programs::XdpContext};
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, udp::UdpHdr};
-use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, Far, NO_QFI};
-use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count_dl, count_qfi_dl}, net::{Ipv4Info, ptr_at_mut}};
+use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_AF11, DSCP_AF13, DSCP_BE, FAR_FORWARD, Far};
+use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count_dl, count_qfi_dl}, net::{EsitoPolicing::{self, Green, NonQos, Red, Yellow}, Ipv4Info, ptr_at_mut}};
 
 
 
@@ -15,14 +15,15 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
             count_dl(CNT_NO_PDR);
             return Ok(XDP_PASS)
         }
-
         Some(pdr) => {
-            let mut qfi = NO_QFI;
-            match unsafe { QER_MAP.get(&pdr.qer_id)} {
-                None => count_dl(CNT_NO_QFI),
-                Some(qer) => {
-                    qfi = qer.qfi;
-                    count_qfi_dl(qfi);
+            let mut qfi = 0;
+            if pdr.qer_id != 0 {
+                match unsafe { QER_MAP.get(&pdr.qer_id)} {
+                    None => count_dl(CNT_NO_QFI),
+                    Some(qer) => {
+                        qfi = qer.qfi;
+                        count_qfi_dl(qfi);
+                    }
                 }
             }
             match unsafe {FAR_MAP.get(&pdr.far_id)} {
@@ -30,15 +31,17 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                 Some(far) => match far.action {
                     FAR_FORWARD => {
                         
-                        let is_yellow = match police_dl(pdr.qer_id, ip.total_length) {
-                            Ok(yellow_flag) => yellow_flag,
-                            Err(_) => {
+                        let dscp = match police_dl(pdr.qer_id, ip.total_length) {
+                            Red => {
                                 count_dl(CNT_DROP_QOS);
                                 return Ok(XDP_DROP)
-                            } 
+                            }
+                            Green => DSCP_AF11,
+                            Yellow => DSCP_AF13,
+                            NonQos => DSCP_BE,
                         };
                         if far.outer_hdr_creation == 1 {
-                            return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi, is_yellow)
+                            return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi, dscp)
                         }
                         count_dl(CNT_FORWARD);
                     }
@@ -55,21 +58,29 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 }
 
 #[inline(always)]
-fn police_dl(qer_id: u32, ip_tot_length: u16) -> Result<bool, ()> {
+fn police_dl(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
+    if qer_id == 0 {
+        count_dl(CNT_NON_QOS);
+        return NonQos
+    }
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count_dl(CNT_NO_QER);
-            return Ok(false);
+            return NonQos;
         }
         Some(qer) => {
-
+            if qer.pir_dl.ns_per_byte == 0 {
+                count_dl(CNT_NON_QOS);
+                return NonQos
+            }
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count_dl(CNT_NO_QER);
-                    return Ok(false) }
+                    return NonQos
+                }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
-                        return Ok(false);
+                        return NonQos;
                     }
                     
                     let now = unsafe {bpf_ktime_get_ns() };
@@ -88,18 +99,18 @@ fn police_dl(qer_id: u32, ip_tot_length: u16) -> Result<bool, ()> {
 
                     // Condizione ROSSO
                     if new_tat_pir - now > qer.pir_dl.burst_tolerance_ns {
-                        return Err(());
+                        return Red;
                     }
                     // Condizione GIALLO
                     else if new_tat_cir - now > qer.cir_dl.burst_tolerance_ns {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
-                        return Ok(true);
+                        return Yellow;
                     }
                     // Condizione VERDE
                     else {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
                         unsafe { (*ptr_qer).tat_cir_dl = new_tat_cir; }
-                        return Ok(false);
+                        return Green;
                     }
                 }
             }
@@ -109,7 +120,7 @@ fn police_dl(qer_id: u32, ip_tot_length: u16) -> Result<bool, ()> {
 
 
 #[inline(always)]
-fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8, is_yellow: bool) -> Result<u32, u32> {
+fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: EthHdr, qfi: u8, dscp: u8) -> Result<u32, u32> {
     let add_hdr: i32 = 44;  // escluso l'eth hdr (ip + udp + gtp-u + ext hdr)
     info!(ctx, "DL Encap: IP total length estratta = {}", total_length as u32);
     if total_length + (add_hdr as u16) > 1500 {
@@ -128,8 +139,7 @@ fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: E
     unsafe {
         // le funzioni set convertono automaticamente in Network Order 
         (*ip_hdr).set_vihl(4, 20);
-        let dscp_value = if is_yellow {14} else {0}; // AF13
-        (*ip_hdr).set_tos(dscp_value, 0);
+        (*ip_hdr).set_tos(dscp, 0);
         (*ip_hdr).set_tot_len(total_length + add_hdr as u16);
         (*ip_hdr).set_id(0);
         (*ip_hdr).ttl = 64;
@@ -188,44 +198,3 @@ fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
     conta = (conta >> 16) + (conta & 0xFFFF); 
     return u16::to_be(!(conta as u16)); //dato che la somma lavora con valori già in Network Order
 }
-
-
-/* // TOKEN BUFFER 
-#[inline(always)]
-fn police_dl(ctx: &XdpContext, qer_id: u32, tot_length: u16) -> Result<u32, ()> {
-    match unsafe { QER_MAP.get(&qer_id) } {
-        None => {
-            return Ok(XDP_PASS);
-        }
-        Some(qer) => match { QER_STATE_MAP.get_ptr_mut(&qer_id)} {
-            None => { return Ok(XDP_PASS) }
-            Some(ptr_qer) => {
-                if ptr_qer.is_null() {
-                    return Ok(XDP_PASS)
-                }
-                let now = unsafe { bpf_ktime_get_ns() };
-                unsafe { if  (*ptr_qer).last_update_dl == 0  {
-                    (*ptr_qer).last_update_dl = now;
-                    }
-                    let delta_ns = now - (*ptr_qer).last_update_dl;
-                    let nuovi_token = (delta_ns * qer.mbr_dl_scaled) >> 30;
-                    (*ptr_qer).tokens_dl += nuovi_token;
-                    if (*ptr_qer).tokens_dl > qer.burst_dl {
-                        (*ptr_qer).tokens_dl = qer.burst_dl
-                    }
-                    if (*ptr_qer).tokens_dl >= tot_length as u64 {
-                        (*ptr_qer).tokens_dl -= tot_length as u64;
-                        (*ptr_qer).last_update_dl = now;
-                        info!(ctx, "pkt dentro limiti MBR");
-                        return Ok(XDP_PASS)
-                    } else {
-                        (*ptr_qer).last_update_dl = now;
-                        info!(ctx, "pkt supera i limiti MBR");
-                        return Err(());
-                    }
-                }
-            }
-        }
-    }
-}
-*/

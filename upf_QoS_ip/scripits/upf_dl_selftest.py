@@ -216,7 +216,7 @@ def check_encap(x, sent_ip, ip_len, a):
     if x["pdu_type"] != 0:                      bad.append("PDU type (DL=0)")
     if x["qfi"] != QFI_DL:                      bad.append("QFI")
     if x["inner"] != sent_ip:                   bad.append("pacchetto interno alterato")
-    if x["tos"] != 0:                           bad.append("TOS != 0 (verde atteso)")
+    if x["tos"] != 0x28:                           bad.append("TOS != 0x28 (verde atteso)")
     return bad
 
 # --------------------------------------------------------------------- tc
@@ -271,7 +271,7 @@ def rate_mbps(pkts, dur):
 def green_share(pkts):
     if not pkts:
         return None
-    return sum(1 for p in pkts if p["tos"] == 0x00) / len(pkts)
+    return sum(1 for p in pkts if p["tos"] == 0x28) / len(pkts)
 
 # ------------------------------------------------------------------ fasi
 

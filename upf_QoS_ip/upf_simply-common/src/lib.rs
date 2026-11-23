@@ -88,6 +88,11 @@ unsafe impl aya::Pod for Qer {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for BucketParam {}
 
+pub const DSCP_BE: u8 = 0;
+pub const DSCP_AF11: u8 = 10;
+pub const DSCP_AF13: u8 = 14;
+
+
 pub const CNT_FORWARD: u32 = 0;
 pub const CNT_DROP_FAR: u32 = 1;
 pub const CNT_NO_PDR: u32 = 2;
@@ -99,5 +104,6 @@ pub const CNT_ERR_INNER_IPV4: u32 = 7;
 pub const CNT_ERR: u32 = 8; // racchiude tutti gli errori generici sui pkts
 pub const CNT_DROP_QOS: u32 = 9;
 pub const CNT_NO_QER: u32 = 10;
-pub const CNT_MAX: u32 = 11;
+pub const CNT_NON_QOS: u32 = 11;
+pub const CNT_MAX: u32 = 12;
 

@@ -225,7 +225,7 @@ def steady_rate_mbps(pkts, dur, warm=1.0, tail=0.3):
     return sum(p["ip_len"] for p in pkts) * 8 / dur / 1e6
 
 def green_share(pkts, dur, warm=1.0, tail=0.3):
-    """Quota di pacchetti verdi (TOS 0x00) a regime, letta dal TOS dell'IP uscente.
+    """Quota di pacchetti verdi (TOS 0x28) a regime, letta dal TOS dell'IP uscente.
     Il giallo e' marcato dall'XDP con DSCP 14 (TOS 0x38)."""
     if not pkts:
         return None
@@ -233,7 +233,7 @@ def green_share(pkts, dur, warm=1.0, tail=0.3):
     sel = [p for p in pkts if t0 + warm <= p["t"] <= t0 + dur - tail]
     if not sel:
         return None
-    return sum(1 for p in sel if p["tos"] == 0x00) / len(sel)
+    return sum(1 for p in sel if p["tos"] == 0x28) / len(sel)
 
 RESULTS = []
 

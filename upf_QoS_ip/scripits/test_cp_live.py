@@ -126,7 +126,7 @@ def worker_rx(duration: float):
         tos = ip[1]
         pkts += 1
         total_bytes += ip_len
-        if tos == 0x00:
+        if tos == 0x28:
             green += 1
         elif tos == 0x38:
             yellow += 1

@@ -110,7 +110,10 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
             let qer_id;
             match qos {
                 Some(q) => {
-                    if q.qer_id != 0 && (q.gbr_mbps <= q.mbr_mbps && q.mbr_mbps > 0) {
+                    if q.qer_id != 0 && q.gbr_mbps <= q.mbr_mbps {
+                        if q.mbr_mbps > 0 && q.burst_bytes < 1500 {
+                            anyhow::bail!("burst_bytes deve essere >= 1500")
+                        }
                         state.qer_state_map.lock().unwrap().insert(q.qer_id, zero_qer_state(state.num_cpus)?, 0)?;
                         state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, cir_ul: make_bucket(q.gbr_mbps, q.burst_bytes, state.cpu_div),
                                                                                         pir_ul: make_bucket(q.mbr_mbps, q.burst_bytes, state.cpu_div),
@@ -137,7 +140,10 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
             let qer_id;
             match qos {
                 Some(q) => {
-                    if q.qer_id != 0 && (q.gbr_mbps <= q.mbr_mbps && q.mbr_mbps > 0) {
+                    if q.qer_id != 0 && q.gbr_mbps <= q.mbr_mbps {
+                        if q.mbr_mbps > 0 && q.burst_bytes < 1500 {
+                            anyhow::bail!("burst-bytes deve essere >= 1500")
+                        }
                         state.qer_state_map.lock().unwrap().insert(q.qer_id, zero_qer_state(state.num_cpus)?, 0)?;
                         state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, cir_ul: make_bucket(0, q.burst_bytes, state.cpu_div),
                                                                                         pir_ul: make_bucket(0, q.burst_bytes, state.cpu_div),
@@ -163,7 +169,10 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
         }
 
         ControlCommand::UpdateQer { qer_id, qfi, gbr_ul_mbps, mbr_ul_mbps, gbr_dl_mbps, mbr_dl_mbps, burst_bytes } => {
-            if qer_id != 0 && ((gbr_ul_mbps <= mbr_ul_mbps && gbr_dl_mbps <= mbr_dl_mbps) && (mbr_ul_mbps > 0 || mbr_dl_mbps > 0 )) {
+            if qer_id != 0 && ((gbr_ul_mbps <= mbr_ul_mbps && gbr_dl_mbps <= mbr_dl_mbps)) {
+                if (mbr_ul_mbps > 0 || mbr_dl_mbps > 0) && burst_bytes < 1500 {
+                    anyhow::bail!("burst_bytes deve essere >= 1500")
+                }
                 if state.qer_state_map.lock().unwrap().get(&qer_id, 0).is_err() {
                     state.qer_state_map.lock().unwrap().insert(qer_id, zero_qer_state(state.num_cpus)?, 0)?;
                 } 

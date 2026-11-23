@@ -2,9 +2,9 @@ use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_AF11, DSCP_AF13, DSCP_BE, FAR_FORWARD, GtpPair, NO_QFI
 };
-use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count_ul, count_qfi_ul}, net::{ptr_at, ptr_at_mut}};
+use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count_qfi_ul, count_ul}, net::{EsitoPolicing::{self, Green, NonQos, Red, Yellow}, ptr_at_mut}};
 
 
 #[inline(always)]
@@ -39,12 +39,24 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
             }
             Some(far) => match far.action {
                 FAR_FORWARD => {
-                    let inner_ip_pkt: *mut Ipv4Hdr = ptr_at_mut(ctx, gtp.payload_offset)?;
-                    info!(ctx, "lunghezza pkt ip interno: {}", unsafe { (*inner_ip_pkt).tot_len()});
-                    if police_ul(pdr.qer_id, inner_ip_pkt).is_err() { // gli devo passa la lunghezza del pkt ip 
-                        count_ul(CNT_DROP_QOS);
-                        return Ok(XDP_DROP);
+                    let inner_ip_pkt: *mut Ipv4Hdr = ptr_at_mut(ctx, gtp.payload_offset).map_err(|_| CNT_ERR_INNER_IPV4)?;
+                    if unsafe { (*inner_ip_pkt).version() } != 4 {
+                        info!(ctx, "inner ip: versione non 4");
+                        return Err(CNT_ERR_INNER_IPV4);
                     }
+                    info!(ctx, "lunghezza pkt ip interno: {}", unsafe { (*inner_ip_pkt).tot_len()});
+                    let dscp = match police_ul(pdr.qer_id, unsafe {(*inner_ip_pkt).tot_len()} ) { // gli devo passa la lunghezza del pkt ip 
+                        Red => {
+                            count_ul(CNT_DROP_QOS);
+                            return Ok(XDP_DROP);
+                        }
+                        Green => DSCP_AF11,
+                        Yellow => DSCP_AF13,
+                        NonQos => DSCP_BE
+                        
+                    };
+                    mark_dscp_checksum_ipv4hdr(inner_ip_pkt, dscp);
+
                     // decapsulazione
                     if pdr.outer_hdr_removed == 1 {
                         return decap_ul(ctx, gtp.payload_offset, eth_hdr_copy)
@@ -64,24 +76,30 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
 }
 
 #[inline(always)]
-fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
+fn police_ul(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
+    if qer_id == 0 {
+        count_ul(CNT_NON_QOS);
+        return NonQos;
+    }
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count_ul(CNT_NO_QER);
-            return Ok(XDP_PASS);
+            return NonQos
         }
         Some(qer) => {
-            
+            if qer.pir_ul.ns_per_byte == 0 {
+                count_ul(CNT_NON_QOS);
+                return NonQos
+            }
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count_ul(CNT_NO_QER);
-                    return Ok(XDP_PASS) }
+                    return NonQos }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
-                        return Ok(XDP_PASS);
+                        return NonQos;
                     }
                     let now = unsafe {bpf_ktime_get_ns() };
-                    let ip_tot_length = unsafe {(*ip_pkt).tot_len()};
                     let cost_ip_pkt_p = (ip_tot_length as u64 * qer.pir_ul.ns_per_byte) >> 30; // calcolo costo di picco
                     let cost_ip_pkt_c = (ip_tot_length as u64 * qer.cir_ul.ns_per_byte) >> 30; // calcolo costo garantito
 
@@ -97,22 +115,19 @@ fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
 
                     // condizione ROSSO 
                     if new_tat_pir - now > qer.pir_ul.burst_tolerance_ns {
-                        return Err(()); // Supera il burst: Drop QoS
+                        return Red; // Supera il burst: Drop QoS
                     }
                     // Condizione GIALLO
                     else if new_tat_cir - now > qer.cir_ul.burst_tolerance_ns {
                         // superamento del CIR, ma non del PIR
-                        unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir;
-                                (*ip_pkt).set_tos(14, 0); // AF13
-                                (*ip_pkt).set_checksum(0);
-                                (*ip_pkt).set_checksum(checksum_ipv4hdr(ip_pkt)); }                        
-                        return Ok(XDP_PASS)
+                        unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir; }                        
+                        return Yellow
                     } 
                     // Condizione VERDE
                     else {
                         unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir; }
                         unsafe { (*ptr_qer).tat_cir_ul = new_tat_cir; }
-                        return Ok(XDP_PASS)
+                        return Green
                     }                    
                 }
             }
@@ -120,7 +135,17 @@ fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
     }
 }
 
-fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
+#[inline(always)]
+fn mark_dscp_checksum_ipv4hdr (ip_hdr: *mut Ipv4Hdr, dscp: u8) {
+    unsafe { if (*ip_hdr).dscp() == dscp {
+        return
+    }}
+    // set dscp
+    unsafe {
+        (*ip_hdr).set_tos(dscp, (*ip_hdr).ecn());
+        (*ip_hdr).set_checksum(0);
+    }
+    //checksum
     let mut conta: u32 = 0;
     let vec_ip_hdr =  ip_hdr as *const [u16; 10];
     for i in 0..10 {
@@ -128,20 +153,15 @@ fn checksum_ipv4hdr (ip_hdr: *const Ipv4Hdr) -> u16 {
     }
     // somma dei vari riporti nei primi 16 bit
     conta = (conta >> 16) + (conta & 0xFFFF); // tale somma potrebbe creare un ulteriore riporto
-    conta = (conta >> 16) + (conta & 0xFFFF); 
-    return u16::to_be(!(conta as u16)); //dato che la somma lavora con valori già in Network Order
+    conta = (conta >> 16) + (conta & 0xFFFF);
+    let checksum = u16::to_be(!(conta as u16)); //dato che la somma lavora con valori già in Network Order
+
+    unsafe { (*ip_hdr).set_checksum(checksum); }
 }
+
 
 #[inline(always)]
 fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32, u32> {
-    let inner_ip: *const Ipv4Hdr = ptr_at(ctx, offset).map_err(|_| {
-        info!(ctx, "inner ip: fuori bounds");
-        CNT_ERR_INNER_IPV4
-    })?;
-    if unsafe { (*inner_ip).version() } != 4 {
-        info!(ctx, "inner ip: versione non 4");
-        return Err(CNT_ERR_INNER_IPV4);
-    }
     
     let delta: i32 = (offset - EthHdr::LEN) as i32; // byte di pkt da togliere (dall'outer ip al gtp-u)
     if unsafe { bpf_xdp_adjust_head(ctx.ctx, delta).is_negative() } {
@@ -156,39 +176,3 @@ fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32
     Ok(XDP_PASS)
 }
 
-// token buffer
-/* #[inline(always)] 
-fn police_ul(qer_id: u32, ip_tot_length: u16) -> Result<u32, ()> {
-    match unsafe { QER_MAP.get(&qer_id) } {
-        None => {
-            return Ok(XDP_PASS);
-        }
-        Some(qer) => match { QER_STATE_MAP.get_ptr_mut(&qer_id)} {
-            None => { return Ok(XDP_PASS) }
-            Some(ptr_qer) => {
-                if ptr_qer.is_null() {
-                    return Ok(XDP_PASS)
-                }
-                let now = unsafe { bpf_ktime_get_ns() };
-                unsafe { if  (*ptr_qer).last_update_ul == 0  {
-                    (*ptr_qer).last_update_ul = now;
-                    }
-                    let delta_ns = now - (*ptr_qer).last_update_ul;
-                    let nuovi_token = (delta_ns * qer.mbr_ul_scaled) >> 30;
-                    (*ptr_qer).tokens_ul += nuovi_token;
-                    if (*ptr_qer).tokens_ul > qer.burst_ul {
-                        (*ptr_qer).tokens_ul = qer.burst_ul
-                    }
-                    if (*ptr_qer).tokens_ul >= ip_tot_length as u64 {
-                        (*ptr_qer).tokens_ul -= ip_tot_length as u64;
-                        (*ptr_qer).last_update_ul = now;
-                        return Ok(XDP_PASS)
-                    } else {
-                        (*ptr_qer).last_update_ul = now;
-                        return Err(());
-                    }
-                }
-            }
-        }
-    }
-} */

@@ -7,7 +7,7 @@ use log::{warn};
 use tokio::{net::UdpSocket, signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, Far, GtpPair, IFACE_ROLE_DN, IFACE_ROLE_RAN, NO_QFI, Pdr, Qer, QerState,
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, Far, GtpPair, IFACE_ROLE_DN, IFACE_ROLE_RAN, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 use std::process::Command;
@@ -24,14 +24,16 @@ struct Opt {
     iface_ran: String,
     #[clap(long)]
     iface_dn: String,
-    #[clap(short, long)]
+    #[clap(long)]
     mbr_dl: u64,
-    #[clap(short, long)]
+    #[clap(long)]
     gbr_dl: u64,
-    #[clap(short, long)]
+    #[clap(long)]
     mbr_ul: u64,
-    #[clap(short, long)]
+    #[clap(long)]
     gbr_ul: u64,
+    #[clap(long, default_value_t = 10)]
+    non_qos_rate: u64,
     #[clap(long, default_value_t = 14)]
     strip_bytes_ul: u32,
     #[clap(long, default_value_t = 58)]
@@ -51,14 +53,16 @@ fn get_ifindex(iface: &str) -> anyhow::Result<u32> {
 }
 
 // funzione che invoca i comandi TC
-fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow::Result<()> {
+fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, non_qos_rate: u64, strip_bytes: u32) -> anyhow::Result<()> {
     let mbr_bps = mbr * 1_000_000;
-    let gbr_bpr = gbr * 1_000_000;
-    println!("Configurazione Traffic Control (HTB Shaper) su {} (MBR: {} Mbps, GBR: {} Mbps)...", iface, mbr, gbr);
+    let gbr_bps = gbr * 1_000_000;
+    let non_qos_rate_bps = non_qos_rate * 1_000_000;
+    println!("Configurazione Traffic Control (HTB Shaper) su {} (MBR: {} Mbps, GBR: {} Mbps, Non-GBR: {} Mbps)...", iface, mbr, gbr, non_qos_rate);
 
     // Formattazione per tc (es. "100000000bit")
     let mbr_str = format!("{}bit", mbr_bps);
-    let gbr_str = format!("{}bit", gbr_bpr);
+    let gbr_str = format!("{}bit", gbr_bps);
+    let non_gbr_str = format!("{}bit", non_qos_rate_bps);
     
     // Assegniamo una rate minima di sussistenza alla coda Gialla (es. 1% dell'MBR) 
     // per rispettare i vincoli di HTB senza rubare banda al GBR.
@@ -68,30 +72,35 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow:
     let commands = [
         format!("tc qdisc del dev {} root", iface),
         if strip_bytes > 0 {
-            format!("tc qdisc add dev {} root handle 1: stab overhead -{} linklayer ethernet htb default 20",
+            format!("tc qdisc add dev {} root handle 1: stab overhead -{} linklayer ethernet htb default 30",
             iface, strip_bytes)
         } else {
-            format!("tc qdisc add dev {} root handle 1: htb default 20", iface)
+            format!("tc qdisc add dev {} root handle 1: htb default 30", iface)
         },
         
+        // QoS Shaper
         // Classe Padre limitata all'MBR globale
         format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {} burst 15000b cburst 15000b", iface, mbr_str, mbr_str),
-        
         // Coda Verde (1:10) - Banda Garantita pari al GBR
-        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b cburst 15000b", iface, gbr_str, mbr_str),
-        
+        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b cburst 15000b prio 0", iface, gbr_str, mbr_str),
         // Coda Gialla (1:20) - Banda base minima, tetto pari all'MBR
-        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b", iface, excess_str, mbr_str),
+        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b prio 1", iface, excess_str, mbr_str),
+
+        // Non-QoS Shaper
+        // Coda Non-QoS (1:30) - Best Effort 
+        format!("tc class add dev {} parent 1: classid 1:30 htb rate {} ceil {} burst 15000b cburst 15000b prio 2", iface, non_gbr_str, non_gbr_str),
         
         // Classi foglia fq_codel per assicurare che il traffico consentito venga consegnato con la massima equità e la minima latenza possibile.
         format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
         format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:30 handle 30: fq_codel", iface),
         // Sotto-code FIFO rigidissime per forzare il Tail Drop
         // format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 100", iface),
         // format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 100", iface),
 
-        format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x00 0xff flowid 1:10", iface),
-        format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xff flowid 1:20", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x28 0xfc flowid 1:10", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xfc flowid 1:20", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 3 u32 match ip tos 0x00 0xfc flowid 1:30", iface),
     ];
 
     for cmd_str in commands.iter() {
@@ -127,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
             gbr_dl,
             mbr_ul,
             gbr_ul,
+            non_qos_rate,
             strip_bytes_dl,
             strip_bytes_ul,
             cp_addr,} = opt;
@@ -242,8 +252,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
     // lo shaper va messo sull'interfaccia di USCITA del tunnel
-    let _ = setup_tc_shaper(&iface_dn, mbr_ul, gbr_ul, strip_bytes_ul);
-    let _ = setup_tc_shaper(&iface_ran, mbr_dl, gbr_dl, strip_bytes_dl);
+    let _ = setup_tc_shaper(&iface_dn, mbr_ul, gbr_ul, non_qos_rate, strip_bytes_ul);
+    let _ = setup_tc_shaper(&iface_ran, mbr_dl, gbr_dl, non_qos_rate, strip_bytes_dl);
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
 
@@ -315,6 +325,7 @@ fn print_counters(
         (CNT_FORWARD, "forward"),
         (CNT_DECAP, "pkts decapsulati"),
         (CNT_ENCAP, "pkts incapsulati"),
+        (CNT_NON_QOS, "pkts Non-QoS"),
         (CNT_DROP_FAR, "drop (FAR)"),
         (CNT_DROP_QOS, "drop (QoS)"),
         (CNT_NO_PDR, "nessun PDR"),

@@ -4,6 +4,14 @@ use aya_log_ebpf::info;
 use network_types::ip::{IpProto, Ipv4Hdr};
 use upf_simply_common::CNT_ERR;
 
+
+pub enum EsitoPolicing {
+    NonQos,
+    Green,
+    Yellow,
+    Red,
+}
+
 #[derive(Clone, Copy)]
 pub struct Ipv4Info {
     pub ihl_bytes: usize,
