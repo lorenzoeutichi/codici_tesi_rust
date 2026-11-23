@@ -49,14 +49,14 @@ Lo userspace espone un **Control Plane asincrono su UDP/JSON** (porta standard P
 ## 🏗️ Architettura del Flusso
 
 ```
-                           [ Control Plane UDP/JSON ]
+                                                      [ Control Plane UDP/JSON ]
                          Tokio UdpSocket (127.0.0.1:8805)
                      add / update_qer / delete -> Arc<Mutex<Maps>>
                                         │
                     (aggiornamento runtime mappe PDR/FAR/QER)
                                         ▼
  gNB (N3) ──GTP-U/IP──▶ iface-ran ──┐          ┌── iface-dn ◀──IP UE── DN (N6)
-                                  ▼          ▼
+                                    ▼          ▼
                     [ Programma XDP Unico (main.rs) ]
                       Lookup ingress_ifindex in IFACE_ROLE_MAP
                                   Eth -> IPv4
@@ -95,7 +95,6 @@ Lo userspace espone un **Control Plane asincrono su UDP/JSON** (porta standard P
        └───────┬───────┘                  └───────┬───────┘
                ▼                                  ▼
            DN (ns-dn)                        gNB (ns-gnb)
-
 ```
 
 ## 🗺️ Mappe eBPF
