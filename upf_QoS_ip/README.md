@@ -1,118 +1,160 @@
 # UPF-Qos-Ip: Prototipo UPF 5G in eBPF/Rust (Architettura Modulare)
 
-Prototipo di data plane per una **UPF 5G** (User Plane Function) scritto in **Rust** utilizzando **eBPF (Aya)**.
+Prototipo di data plane e control plane leggero per una **UPF 5G** (User Plane Function) scritto in **Rust** utilizzando **eBPF (Aya)** e **Tokio**.
 
-Un programma **XDP** intercetta il traffico, esegue un dispatch tra flussi Uplink e Downlink, analizza gli header GTP-U (inclusi gli Extension Headers per ricavare il **QFI**) ed applica le logiche di routing e QoS basate sulle tabelle **PDR** (Packet Detection Rule), **FAR** (Forwarding Action Rule) e **QER** (QoS Enforcement Rule) caricate in mappe eBPF.
+Un singolo programma **XDP** agganciato simultaneamente alle interfacce **RAN** (N3) e **Data Network** (N6) intercetta il traffico in modalità **Full-Duplex**, esegue il dispatch tra flussi Uplink e Downlink in base all'interfaccia di ingresso (`ingress_ifindex`), analizza gli header GTP-U (inclusi gli Extension Headers per ricavare il **QFI**) e applica le logiche di routing e QoS basate sulle tabelle **PDR** (Packet Detection Rule), **FAR** (Forwarding Action Rule) e **QER** (QoS Enforcement Rule) caricate in mappe eBPF.
 
-Gli eventi GTP-U vengono inviati allo userspace tramite `RingBuf`, mentre le statistiche globali, gli errori specifici e il tracciamento per singolo flusso QoS vengono gestiti tramite mappe per-CPU.
+Lo userspace espone un **Control Plane asincrono su UDP/JSON** (porta standard PFCP `8805`) per aggiungere, modificare e rimuovere regole a runtime senza interrompere il data plane, legge gli eventi GTP-U tramite `RingBuf` e raccoglie statistiche separate per direzione (Uplink/Downlink) e per singolo flusso QoS tramite mappe per-CPU.
 
-> 🚀 **Stato:** Prototipo validato funzionalmente in **Uplink e Downlink** su topologia a namespace (veth). L'architettura **trTCM (Two Rate Three Color Marker)** ibrida è completa: il programma XDP esegue il policing lock-free (Dual GCRA) e la marcatura dinamica (DSCP), delegando lo shaping e la prioritizzazione al **Linux Traffic Control (TC)** a valle. La QoS è stata verificata su singolo flusso; il comportamento su più CPU è documentato tra i [limiti noti](#-limiti-noti).
+> 🚀 **Stato:** Prototipo **Full-Duplex** validato funzionalmente in **Uplink, Downlink e gestione dinamica a runtime** su una singola istanza UPF in topologia a namespace (`veth`). L'architettura **trTCM (Two Rate Three Color Marker)** ibrida è completa su entrambe le direzioni: XDP esegue il policing lock-free (Dual GCRA) e la marcatura dinamica (DSCP), delegando lo shaping e l'accodamento al **Linux Traffic Control (TC)** configurato su entrambe le interfacce di egress. La QoS è stata verificata su singolo core per direzione; il comportamento multi-CPU è documentato tra i [limiti noti](#️-limiti-noti).
 
 ## ✨ Funzionalità Attuali
 
-* **Architettura XDP Modulare:** Codice kernel separato in moduli logici (`net`, `gtp`, `uplink`, `downlink`, `maps`), senza puntatori invalidi (stale pointers) dopo le chiamate a `adjust_head`.
+* **UPF Full-Duplex (Singola Istanza N3 + N6):** Un unico programma XDP viene caricato una sola volta e agganciato contemporaneamente alle interfacce `--iface-ran` (RAN) e `--iface-dn` (DN). Il dispatch non dipende più solo dalla porta UDP, ma identifica la sorgente leggendo `ingress_ifindex` e consultando `IFACE_ROLE_MAP` (`IFACE_ROLE_RAN` / `IFACE_ROLE_DN`), in aderenza al concetto 3GPP di *Source Interface*.
 
-* **Parsing XDP e Gestione Errori Unificata:** Validazione della catena Ethernet → IPv4 → UDP → GTP-U v1. Gli errori sono mappati direttamente in contatori specifici tramite l'uso idiomatico di `Result<T, u32>`.
+* **Control Plane Dinamico Asincrono (Mini-PFCP su UDP/JSON):** Il modulo `control.rs` esegue un listener Tokio `UdpSocket` (default `127.0.0.1:8805`) che condivide in sicurezza le mappe eBPF tramite `ControlState` (`Arc<Mutex<...>>` con ownership acquisita via `take_map`). Supporta inserimento, aggiornamento QoS live (senza azzerare i TAT dei flussi attivi) e rimozione delle sessioni tramite comandi JSON, rispondendo con esiti strutturati `{"ok": bool, "message": "..."}`. Le scritture seguono l'ordine sicuro `QER_STATE -> QER -> FAR -> PDR` (inverso in cancellazione) per garantire consistenza con i lettori lock-free in XDP.
 
-* **Decapsulazione Uplink & Incapsulazione Downlink:** Rimozione e aggiunta dinamica di header (IPv4, UDP, GTP-U ed Extension Headers) con ricalcolo del checksum IPv4 dell'header esterno. In downlink l'IP interno può essere lungo al massimo **1456 B** (outer = 1500 B): oltre, il pacchetto non viene incapsulato e incrementa il contatore di errore.
+* **Architettura XDP Modulare:** Codice kernel separato in moduli logici (`net`, `gtp`, `uplink`, `downlink`, `maps`), privo di puntatori invalidi (*stale pointers*) dopo le chiamate a `bpf_xdp_adjust_head`.
 
-* **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink), anche con catene di più extension header, ed emissione in uscita (Downlink) del container `0x85` con il **QFI** (QoS Flow Identifier) letto dalla QER.
+* **Parsing XDP e Gestione Errori Unificata per Direzione:** Validazione della catena Ethernet $\rightarrow$ IPv4 $\rightarrow$ UDP $\rightarrow$ GTP-U v1. Gli errori sono mappati tramite `Result<T, u32>` e instradati automaticamente dall'entrypoint XDP nella mappa contatori della direzione corretta (`COUNTERS_UL` o `COUNTERS_DL`).
 
-* **Rate Limiting in XDP (trTCM / Dual GCRA, stato per-CPU):** per ogni pacchetto si calcola il costo temporale `lunghezza_IP_interno × ns_per_byte` e si aggiornano due TAT (Theoretical Arrival Time), uno per il CIR (GBR) e uno per il PIR (MBR):
+* **Decapsulazione Uplink & Incapsulazione Downlink:** Rimozione e aggiunta dinamica di header (IPv4, UDP, GTP-U ed Extension Headers) con ricalcolo del checksum IPv4 dell'header esterno. In downlink l'IP interno può essere lungo al massimo **1456 B** (outer = 1500 B): oltre tale soglia il pacchetto non viene incapsulato e incrementa `CNT_ERR` in `COUNTERS_DL`.
 
-  * **Rosso (> MBR):** il nuovo TAT di picco eccede la burst tolerance. XDP esegue `XDP_DROP`, senza aggiornare alcun TAT.
+* **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink), anche con catene di più extension header, ed emissione in uscita (Downlink) del container `0x85` (*PDU Session Container*) con il **QFI** letto dalla QER.
 
-  * **Giallo (tra GBR e MBR):** il traffico eccede il CIR ma non il PIR. Passa, aggiorna solo il TAT di picco, e XDP **marca il TOS/DSCP** (`0x38`, DSCP 14 / AF13) ricalcolando il checksum. In uplink la marcatura è sull'IP interno (prima della decap), in downlink sull'header esterno (in fase di encap).
+* **Rate Limiting in XDP (trTCM / Dual GCRA, stato per-CPU):** Per ogni pacchetto si calcola il costo temporale $\text{lunghezza\_IP\_interno} \times \text{ns\_per\_byte}$ (in aritmetica a virgola fissa Q30) e si aggiornano due TAT (*Theoretical Arrival Time*), uno per il CIR (GBR) e uno per il PIR (MBR):
 
-  * **Verde (< GBR):** rispetta la banda garantita. Aggiorna entrambi i TAT; il TOS non viene modificato.
+  * **Rosso (**$> \text{MBR}$**):** Il nuovo TAT di picco eccede la burst tolerance. XDP esegue `XDP_DROP`, senza aggiornare alcun TAT.
 
-  La burst tolerance include il costo del pacchetto corrente, quindi deve essere almeno pari al pacchetto più grande: il progetto usa **15000 B** per CIR e PIR.
+  * **Giallo (tra GBR e MBR):** Il traffico eccede il CIR ma non il PIR. Passa, aggiorna solo il TAT di picco, e XDP **marca il TOS/DSCP** (`0x38`, DSCP 14 / AF13) ricalcolando il checksum. In uplink la marcatura avviene sull'IP interno (prima della decap), in downlink sull'header esterno (in fase di encap).
 
-* **Traffic Control (TC) Shaping (HTB & fq_codel):** il control-plane istanzia automaticamente un albero `qdisc` HTB sull'interfaccia di egress, con filtri `u32` sul TOS impostato da XDP:
+  * **Verde (**$< \text{GBR}$**):** Rispetta la banda garantita. Aggiorna entrambi i TAT; il TOS non viene modificato.
+
+  La burst tolerance include il costo del pacchetto corrente, quindi deve essere almeno pari al pacchetto più grande: il progetto usa **15000 B** di default per CIR e PIR.
+
+* **Traffic Control (TC) Shaping Bidirezionale (HTB & `fq_codel`):** Il control plane istanzia automaticamente due alberi `qdisc` HTB speculari sulle rispettive interfacce di egress (`iface_dn` per l'Uplink, `iface_ran` per il Downlink), con filtri `u32` sul TOS impostato da XDP:
 
   * **Root `1:1`:** `rate = ceil = MBR`.
 
   * **Coda Verde `1:10`:** `rate = GBR`, `ceil = MBR`.
 
-  * **Coda Gialla `1:20`:** `rate` pari all'1% dell'MBR, `ceil = MBR`; è anche la classe di default per i pacchetti con TOS non riconosciuto.
+  * **Coda Gialla `1:20`:** `rate` pari all'1% dell'MBR, `ceil = MBR`; funge anche da classe di default per pacchetti con TOS non riconosciuto.
 
-  * Le code foglia sono `fq_codel`; 
+  * Le code foglia sono configurate con **`fq_codel`** per contenere la latenza di accodamento e garantire equità sui flussi consentiti (in alternativa a `pfifo`, presente come opzione commentata).
 
-* **HTB che misura solo l'IP interno:** il policer XDP conta l'IP interno, mentre l'HTB conta di default tutto il frame (Ethernet e, in DL, anche l'outer header da 44 B). L'opzione `--strip-bytes N` installa sulla qdisc root una size table `stab overhead -N`, così l'HTB e il policer misurano la stessa grandezza. Valori: **14** in uplink (Ethernet), **58** in downlink (Ethernet + IP + UDP + GTP-U + campi opzionali + extension header). Con `--strip-bytes 0` si ottiene l'HTB standard.
+* **Allineamento delle Unità HTB (`--strip-bytes-ul` / `--strip-butes-dl`):** Il policer XDP conta l'IP interno, mentre l'HTB conta di default l'intero frame. Le opzioni `--strip-bytes-ul` (default **14 B**: Ethernet su N6) e           `--strip-bytes-dl` (default **58 B**: Ethernet + outer IP/UDP/GTP-U/Ext su N3) installano una size table `stab overhead -N` sulle rispettive qdisc root, allineando le misure tra XDP e TC. Impostando `0` si ottiene l'HTB standard.
 
-* **Telemetria e report:** eventi per ogni pacchetto GTP-U (message type, TEID, QFI) tramite `RingBuf`, letti dallo userspace; ogni 5 secondi il programma stampa i contatori XDP e le statistiche `tc -s class` dell'interfaccia di uscita.
+* **Telemetria Separata e Report Tabellare:** Eventi per pacchetto GTP-U (`GtpPair`) tramite `RingBuf`; ogni 5 secondi e alla chiusura (`Ctrl+C`), lo userspace stampa una tabella affiancata (`Uplink | Downlink | Totale`) per i contatori XDP e per ogni QFI attivo, seguita dalle statistiche `tc -s class` di entrambe le interfacce di uscita.
 
 ## 🏗️ Architettura del Flusso
 
 ```
- Scapy / RAN ──Traffico (GTP/IP)──▶ Interfaccia di Ingresso
+                           [ Control Plane UDP/JSON ]
+                         Tokio UdpSocket (127.0.0.1:8805)
+                     add / update_qer / delete -> Arc<Mutex<Maps>>
                                         │
-                    [ Programma XDP - Dispatcher (main.rs) ]
-                                Eth → IPv4
-                                        │
-                       (Protocollo == UDP && Porta == 2152)?
-                                 /             \
-                               SÌ               NO
-                               /                 \
-                  [ MODULO UPLINK ]          [ MODULO DOWNLINK ]
-            Estrazione iterativa QFI            Lookup IP UE in DL_PDR_MAP
-            Evento su RingBuf                          │
-                       │                               │
-      UL_PDR_MAP[TEID] ┤                               ├─ Lookup QER_MAP (qer_id)
-                       │                               │
-       FAR_MAP[far_id] ┴─ DROP/FORWARD                 ├─ FAR Action
-                       │                               │
-        [ trTCM Rate Limiting (Dual GCRA) ]   [ trTCM Rate Limiting (Dual GCRA) ]
-         (CIR/PIR UL, Drop QoS se rosso)       (CIR/PIR DL, Drop QoS se rosso)
-                       │                               │
-    [ Marcatura TOS giallo sull'IP interno ]  [ Incapsulazione ]
-                       │                      (IP+UDP+GTP+Ext, TOS giallo
-                       │                       sull'header esterno)
-           [ Decapsulazione (adjust_head) ]            │
-           (Rimozione header tunnel)            Calcolo Checksum IPv4
-                       │                               │
-                   XDP_PASS                        XDP_PASS
-                       │                               │
- ══════════════════════▼═══════════════════════════════▼═════════════════════
-          [ Linux Traffic Control (TC) - Egress Interface ]
-          (UL: veth-n6 → DN       DL: veth-n3 → gNB)
-                               │
-                  Root HTB (MBR) + stab overhead -N
-                               │
-               ┌───────────────┴───────────────┐
-       Filtro TOS 0x00                 Filtro TOS 0x38 (AF13)
-               │                               │
-       [ Coda VERDE (GBR) ]            [ Coda GIALLA (fino a MBR) ]
-               │                               │
-               └───────────────┬───────────────┘
-                               ▼
-                        Uscita Fisica
-```
+                    (aggiornamento runtime mappe PDR/FAR/QER)
+                                        ▼
+ gNB (N3) ──GTP-U/IP──▶ iface-ran ──┐          ┌── iface-dn ◀──IP UE── DN (N6)
+                                  ▼          ▼
+                    [ Programma XDP Unico (main.rs) ]
+                      Lookup ingress_ifindex in IFACE_ROLE_MAP
+                                  Eth -> IPv4
+                                  /          \
+                       (IFACE_ROLE_RAN)   (IFACE_ROLE_DN)
+                              /                  \
+                   UDP dport == 2152?             │
+                       SÌ │  NO -> PASS           │
+                          ▼                       ▼
+                  [ MODULO UPLINK ]      [ MODULO DOWNLINK ]
+            Estrazione iterativa QFI       Lookup IP UE in DL_PDR_MAP
+            Evento su RingBuf                     │
+                       │                          ├─ Lookup QER_MAP (qer_id)
+      UL_PDR_MAP[TEID] ┤                          ├─ FAR Action (DROP/FWD)
+       FAR_MAP[far_id] ┴─ DROP/FWD                │
+                       │                          │
+        [ trTCM Policing (Dual GCRA) ]   [ trTCM Policing (Dual GCRA) ]
+         (CIR/PIR UL, Drop se rosso)      (CIR/PIR DL, Drop se rosso)
+                       │                          │
+      [ Marcatura TOS 0x38 su IP int ]   [ Incapsulazione 44 B + QFI 0x85 ]
+                       │                 (TOS 0x38 su IP ext + Checksum)
+           [ Decapsulazione ]                     │
+         (adjust_head positivo)                   │
+                       │                          │
+               COUNTERS_UL / QFI_UL       COUNTERS_DL / QFI_DL
+                   XDP_PASS                   XDP_PASS
+                       │                          │
+ ══════════════════════▼══════════════════════════▼═════════════════════════
+        [ TC Egress UL: veth-n6 ]        [ TC Egress DL: veth-n3 ]
+        HTB (MBR) + stab -14 B           HTB (MBR) + stab -58 B
+               │                                  │
+       ┌───────┴───────┐                  ┌───────┴───────┐
+   TOS 0x00        TOS 0x38           TOS 0x00        TOS 0x38
+ [ Verde 1:10 ]  [ Giallo 1:20 ]    [ Verde 1:10 ]  [ Giallo 1:20 ]
+   (fq_codel)      (fq_codel)         (fq_codel)      (fq_codel)
+       └───────┬───────┘                  └───────┬───────┘
+               ▼                                  ▼
+           DN (ns-dn)                        gNB (ns-gnb)
 
-L'XDP è attaccato alla sola interfaccia di ingresso (`--iface-in`) e lo shaper alla sola interfaccia di uscita (`--iface-out`): uplink e downlink si provano con **due istanze distinte** a interfacce invertite.
+```
 
 ## 🗺️ Mappe eBPF
 
-| Nome Mappa | Tipo | Chiave | Valore | Scopo |
-| ----- | ----- | ----- | ----- | ----- |
-| `UL_PDR_MAP` | HashMap | TEID (u32) | `Pdr` { far_id, qer_id, outer_hdr_removed } | Regole di forwarding Uplink |
-| `DL_PDR_MAP` | HashMap | IP UE (u32) | `Pdr` { far_id, qer_id } | Regole di forwarding Downlink (routing IP) |
-| `FAR_MAP` | HashMap | far_id (u32) | `Far` { action, outer_hdr_creation, peer_ip, peer_teid, local_ip } | Azione (FORWARD/DROP) e parametri di tunnel |
-| `QER_MAP` | HashMap | qer_id (u32) | `Qer` { qfi, cir_ul, pir_ul, cir_dl, pir_dl } | Parametri QoS; ogni `BucketParam` ha `ns_per_byte` e `burst_tolerance_ns`, calcolati in userspace |
-| `QER_STATE_MAP` | PerCpuHashMap | qer_id (u32) | `QerState` { tat_cir_ul, tat_pir_ul, tat_cir_dl, tat_pir_dl } | Stato dei TAT, lock-free |
-| `COUNTERS` | PerCpuArray | indice globale (u32) | `u64` | Forward, decap, encap, drop FAR/QoS, no PDR/FAR/QER/QFI, errori |
-| `QFI_COUNTERS` | PerCpuArray | valore QFI (u32) | `u64` | Statistiche per flusso QoS |
-| `IP_EVENTS` | RingBuf | – | `GtpPair` | Eventi GTP-U verso userspace |
+| Nome Mappa | Tipo | Chiave | Valore | Scopo | 
+| ----- | ----- | ----- | ----- | ----- | 
+| `IFACE_ROLE_MAP` | `HashMap` | `ifindex` (`u32`) | Ruolo (`u8`: `RAN` / `DN`) | Dispatch Full-Duplex basato sull'interfaccia di ingresso | 
+| `UL_PDR_MAP` | `HashMap` | TEID (`u32`) | `Pdr { far_id, qer_id, outer_hdr_removed }` | Regole di forwarding Uplink | 
+| `DL_PDR_MAP` | `HashMap` | IP UE (`u32`) | `Pdr { far_id, qer_id, outer_hdr_removed }` | Regole di forwarding Downlink (routing IP) | 
+| `FAR_MAP` | `HashMap` | `far_id` (`u32`) | `Far { action, outer_hdr_creation, peer_ip, peer_teid, local_ip }` | Azione (`FORWARD`/`DROP`) e parametri del tunnel | 
+| `QER_MAP` | `HashMap` | `qer_id` (`u32`) | `Qer { qfi, cir_ul, pir_ul, cir_dl, pir_dl }` | Parametri QoS (`ns_per_byte` Q30 e `burst_tolerance_ns`) | 
+| `QER_STATE_MAP` | `PerCpuHashMap` | `qer_id` (`u32`) | `QerState { tat_cir_ul, tat_pir_ul, tat_cir_dl, tat_pir_dl }` | Stato dei TAT del Dual GCRA, lock-free | 
+| `COUNTERS_UL` | `PerCpuArray` | indice (`u32`) | `u64` | Statistiche ed errori specifici del ramo Uplink | 
+| `COUNTERS_DL` | `PerCpuArray` | indice (`u32`) | `u64` | Statistiche ed errori specifici del ramo Downlink | 
+| `QFI_COUNTERS_UL` | `PerCpuArray` | valore QFI (`u32`) | `u64` | Conteggio pacchetti per QFI (0–63) in Uplink | 
+| `QFI_COUNTERS_DL` | `PerCpuArray` | valore QFI (`u32`) | `u64` | Conteggio pacchetti per QFI (0–63) in Downlink | 
+| `IP_EVENTS` | `RingBuf` | – | `GtpPair` | Eventi GTP-U (message type, TEID, QFI) verso userspace | 
 
-### Configurazione di test (inserita dal control plane)
+*(Gli indirizzi IPv4 e i TEID vengono convertiti in Host Byte Order prima del lookup).*
 
-| Direzione | Chiave | Regola |
-| ----- | ----- | ----- |
-| UL | TEID 9999 | FAR 1 (forward, decap), QER 1 |
-| UL | TEID 8888 | FAR 2 (drop) |
-| DL | UE 10.60.0.1 | FAR 3 (encap verso gNB 10.0.3.2, TEID 7001, sorgente 10.0.3.1), QER 2 |
+## 🎛️ Control Plane Dinamico (Mini-PFCP su UDP/JSON)
 
-Topologia: `ns-gnb` (10.0.3.2) ⇄ `veth-gnb`/`veth-n3` ⇄ UPF sull'host ⇄ `veth-n6`/`veth-dn` ⇄ `ns-dn` (10.0.6.2).
+Il control plane rimane in ascolto sull'indirizzo passato via `--cp-addr` (default `127.0.0.1:8805`) e accetta datagrammi JSON mappati sull'enum `ControlCommand` (`"cmd"`):
+
+| Comando (`cmd`) | Funzione | Campi principali | 
+| ----- | ----- | ----- | 
+| `add_uplink` | Crea/aggiorna sessione UL | `teid`, `far_id`, `far_action` (`forward`/`drop`), `outer_hdr_removed`, `qos` (opzionale) | 
+| `add_downlink` | Crea/aggiorna sessione DL | `ue_ip`, `far_id`, `far_action`, `peer_ip`, `peer_teid`, `local_ip`, `outer_hdr_creation`, `qos` | 
+| `update_qer` | Aggiorna QoS a runtime | `qer_id`, `qfi`, `gbr_ul_mbps`, `mbr_ul_mbps`, `gbr_dl_mbps`, `mbr_dl_mbps`, `burst_bytes` | 
+| `delete_uplink` | Rimuove PDR UL | `teid` | 
+| `delete_downlink` | Rimuove PDR DL | `ue_ip` | 
+
+Ogni comando viene validato prima della scrittura (es. `qer_id != 0`, `gbr <= mbr`). Errori di sintassi JSON o parametri invalidi vengono restituiti al client con `{"ok": false, "message": "..."}` senza interrompere il servizio né alterare le regole esistenti.
+
+**Esempi di invio a caldo tramite `nc`:**
+
+```
+# Aggiunta sessione Uplink sul TEID 5555 (QFI 9, GBR 10 Mbps, MBR 20 Mbps)
+echo '{"cmd":"add_uplink","teid":5555,"far_id":10,"far_action":"forward","qos":{"qer_id":10,"qfi":9,"gbr_mbps":10,"mbr_mbps":20,"burst_bytes":15000}}' | nc -u -w1 127.0.0.1 8805
+
+# Modifica banda live (throttling da 20 Mbps a 2 Mbps senza resettare i TAT)
+echo '{"cmd":"update_qer","qer_id":10,"qfi":9,"gbr_ul_mbps":1,"mbr_ul_mbps":2}' | nc -u -w1 127.0.0.1 8805
+
+# Rimozione sessione Uplink
+echo '{"cmd":"delete_uplink","teid":5555}' | nc -u -w1 127.0.0.1 8805
+
+```
+
+### Configurazione di test precaricata all'avvio
+
+All'avvio, lo userspace inserisce le seguenti regole di base passando direttamente dalla pipeline `apply_command`:
+
+| Direzione | Chiave | Regola | 
+| ----- | ----- | ----- | 
+| UL | TEID `9999` | FAR `1` (forward, decap), QER `1` (`qfi=5`, GBR/MBR da CLI) | 
+| UL | TEID `8888` | FAR `2` (drop), nessuna QER | 
+| DL | UE `10.60.0.1` | FAR `3` (encap verso gNB `10.0.3.2`, TEID `7001`, sorgente `10.0.3.1`), QER `2` (`qfi=5`, GBR/MBR da CLI) | 
+
+Topologia: `ns-gnb` (`10.0.3.2`) $\rightleftarrows$ `veth-gnb`/`veth-n3` $\rightleftarrows$ UPF sull'host $\rightleftarrows$ `veth-n6`/`veth-dn` $\rightleftarrows$ `ns-dn` (`10.0.6.2`).
 
 ## 🛠️ Build ed Esecuzione
 
@@ -127,94 +169,106 @@ cargo build --release
 
 ### 2. Creazione Namespace (Topologia di Test)
 
-Esegui `scripts/setup_netns.sh` per creare i namespace (`ns-gnb`, `ns-dn`) e le coppie `veth`.
-### 3. Esecuzione del Control Plane (User Space)
-
-Parametri: interfaccia di ingresso, interfaccia di uscita (dove si installa lo shaper), MBR e GBR in **Mbps**, e `--strip-bytes` (byte non contati dall'HTB). Il GBR deve essere minore dell'MBR (con GBR + 1% MBR ≤ MBR, per il vincolo HTB sulle classi figlie) e con rate oltre ~100 Mbps l'HTB segnala un quantum troppo grande.
-
-**Uplink:**
+Esegui `scripts/setup_netns.sh` per creare i namespace (`ns-gnb`, `ns-dn`) e le coppie `veth`:
 
 ```
-sudo ./target/release/upf_simply --iface-in veth-n3 --iface-out veth-n6 --mbr 20 --gbr 10 --strip-bytes 14
+sudo bash scripts/setup_netns.sh
 ```
 
-**Downlink:**
+### 3. Avvio della UPF Full-Duplex
+
+Una **singola istanza** gestisce contemporaneamente Uplink (`veth-n3` $\rightarrow$ `veth-n6`), Downlink (`veth-n6` $\rightarrow$ `veth-n3`), entrambi gli shaper TC e il Control Plane UDP (`127.0.0.1:8805`):
 
 ```
-sudo ./target/release/upf_simply --iface-in veth-n6 --iface-out veth-n3 --mbr 20 --gbr 10 --strip-bytes 58
+sudo ./target/release/upf_simply \
+  --iface-ran veth-n3 --iface-dn veth-n6 \
+  --mbr 20 --gbr 10 \
+  --strip-bytes-ul 14 --strip-bytes-dl 58 \
+  --cp-addr 127.0.0.1:8805
+
 ```
 
-Esegui un'istanza alla volta.
+*(Vincolo HTB sulle classi figlie:* $\text{GBR} + 0.01 \cdot \text{MBR} \le \text{MBR}$*; oltre* $\sim 100\text{ Mbps}$ *HTB segnala un quantum troppo grande).*
 
-### 4. Test automatici (Scapy + tcpdump)
+### 4. Test Automatici (Data Plane UL/DL e Control Plane Live)
 
-Gli script generano traffico a rate controllato, catturano l'uscita con `tcpdump` e confrontano i risultati con i valori attesi. Il sender va fissato a una CPU con `taskset`, perché lo stato dei TAT è per-CPU.
+I sender vanno fissati a una CPU con `taskset` poiché lo stato dei TAT risiede in una `PerCpuHashMap`. Con l'istanza Full-Duplex attiva, i test possono essere eseguiti in sequenza o **in parallelo** (assegnando CPU distinte, es. `-c 2` per UL e `-c 3` per DL) senza riavviare la UPF.
 
 **Uplink** (dentro `ns-gnb`, cattura in `ns-dn`):
 
 ```
-sudo taskset -c 2 ip netns exec ns-gnb python3 upf_ul_selftest.py --mbr 20 --gbr 10 \
-        --tc-if veth-n6 --green-class 1:10 --yellow-class 1:20 \
-        --burst-bytes 15000 --htb-overhead 0
+sudo taskset -c 2 ip netns exec ns-gnb python3 scripts/upf_ul_selftest.py \
+  --mbr 20 --gbr 10 --tc-if veth-n6 \
+  --green-class 1:10 --yellow-class 1:20 \
+  --burst-bytes 15000 --htb-overhead 0
+
 ```
 
 **Downlink** (dentro `ns-dn`, cattura in `ns-gnb`):
 
 ```
-sudo taskset -c 2 ip netns exec ns-dn python3 upf_dl_selftest.py --mbr 20 --gbr 10 \
-        --tc-if veth-n3 --green-class 1:10 --yellow-class 1:20 \
-        --burst-bytes 15000 --htb-overhead 0
+sudo taskset -c 3 ip netns exec ns-dn python3 scripts/upf_dl_selftest.py \
+  --mbr 20 --gbr 10 --tc-if veth-n3 \
+  --green-class 1:10 --yellow-class 1:20 \
+  --burst-bytes 15000 --htb-overhead 0
+
 ```
 
-Passare `--htb-overhead 0` dice agli script che l'HTB conta solo l'IP interno (cioè che l'istanza UPF è stata avviata con `--strip-bytes`). Senza `--strip-bytes`, ometti l'opzione: gli script usano il valore naturale (14 B in UL, 58 B in DL).
+**Control Plane Dinamico Live** (sull'host, invia comandi UDP e traffico GTP-U reale tra `ns-gnb` e `ns-dn`):
 
-| Fase | Verifica |
-| ----- | ----- |
-| 1. Funzionale | UL: parsing e decap con flag `0x30`/`0x32`/`0x34` e catena di extension header, TEID in drop e senza PDR.  DL: ogni campo dell'outer header (checksum, lunghezze, TEID, QFI), pacchetto interno identico, limite MTU, UE senza PDR |
-| 2. Sweep di rate | Uscita ≈ min(offerto, MBR); quota di verde ≈ min(offerto, GBR) / min(offerto, MBR), letta dal TOS dei pacchetti e dai contatori delle classi HTB |
-| 3. Dimensione pacchetto | Con carico oltre l'MBR l'uscita resta ≈ MBR per IP interno da 100, 500, 1000 e 1400 B |
-| 4. Burst | Dopo quiete passano circa `burst + MBR × tempo di invio` byte |
-| 5. Ricarica | Dopo una pausa un pacchetto passa |
+```
+sudo python3 scripts/test_cp_live.py
+```
 
-**Come verificare l'inserimento dell'header (manuale):**
+| Suite / Fase | Verifica | 
+| ----- | ----- | 
+| **UL/DL Fase 1 (Funzionale)** | UL: parsing e decap con flag `0x30`/`0x32`/`0x34` e catena di extension header, TEID in drop e senza PDR. DL: ogni campo dell'outer header (checksum, lunghezze, TEID, QFI), integrità payload interno, limite MTU (`1456 B` vs `1457 B`), UE senza PDR | 
+| **UL/DL Fase 2 (Sweep di rate)** | Uscita $\approx \min(\text{offerto}, \text{MBR})$; quota verde $\approx \min(\text{offerto}, \text{GBR}) / \min(\text{offerto}, \text{MBR})$, verificata su TOS e contatori HTB | 
+| **UL/DL Fase 3 (Dimensione)** | Con carico oltre l'MBR, l'uscita resta $\approx \text{MBR}$ per IP interno da 100, 500, 1000 e 1400 B | 
+| **UL/DL Fase 4–5 (Burst & Ricarica)** | Dopo quiete passano circa $\text{burst} + \text{MBR} \times t_{\text{invio}}$ byte; dopo pausa il bucket si ricarica | 
+| **Control Plane Live** | Rifiuto JSON malformati e `GBR > MBR`; creazione sessione live (TEID `5555`); throttling live `update_qer` ($20 \rightarrow 2\text{ Mbps}$); rilascio sessione `delete_uplink` e verifica di `PDR NON TROVATA` | 
+
+**Verifica manuale dell'header incapsulato:**
 
 ```
 sudo ip netns exec ns-gnb tcpdump -i veth-gnb -n -vv -X udp port 2152
 ```
 
-### Risultati di validazione
+### Risultati di Validazione
 
-Con MBR = 20 Mbps, GBR = 10 Mbps, burst 15000 B e `--strip-bytes` attivo, entrambi gli script chiudono con **0 FAIL** (Uplink: 18 verifiche, Downlink: 17):
+Eseguendo in sequenza sulla stessa istanza Full-Duplex (`MBR = 20 Mbps`, `GBR = 10 Mbps`, burst `15000 B`, `--strip-ul 14`, `--strip-dl 58`) le suite `upf_ul_selftest.py`, `upf_dl_selftest.py` e `test_cp_live.py`:
 
-* Uscita entro la tolleranza (8%) dell'MBR a saturazione, per ogni dimensione di pacchetto, in entrambe le direzioni.
+* **Control Plane Live (`test_cp_live.py`):** **100% PASS** su tutte le verifiche. Con `update_qer` da `20 Mbps` a `2 Mbps` (`GBR = 1 Mbps`) su un flusso offerto a `15 Mbps`, il throughput misurato si attesta a **`2.04 Mbps`** (`389` pacchetti verdi e `375` gialli su 3 s), in pieno accordo con il modello teorico Dual GCRA.
 
-* Quota di verde 1,00 / 0,67 / 0,56 / 0,50 ai punti di carico offerto 5 e 9 / 15 / 18 / 30 e 60 Mbps, come da formula.
+* **Isolamento Full-Duplex e Bilancio Esatto dei Contatori:** Su oltre **600.000 pacchetti** elaborati in una singola sessione:
 
-* Il numero di pacchetti verdi per fase coincide con quello atteso dal GBR (6264 su 5 s a 1250 pps più il burst iniziale).
+  * **Uplink:** `204.539` decapsulati + `20` drop FAR + `110.206` drop QoS + `100` nessun PDR = **`314.865`**, identico alla somma dei QFI (`292.145` QFI 5 + `22.640` QFI 9 + `80` senza QFI); `0` incapsulazioni e `0` errori.
 
-* I conteggi finali dei contatori XDP e delle classi HTB sono coerenti tra loro.
+  * **Downlink:** `191.739` incapsulati + `100.595` drop QoS + `20` errori MTU (`1457 B`) = **`292.354`**, identico a `QFI 5 = 292.354` (più `20` pacchetti verso UE senza PDR); `0` decapsulazioni.
 
-Le misure sono prese su veth con un generatore software e rate fino a 60 Mbps offerti: sono adatte a verificare la correttezza, non le prestazioni.
+  * **Traffic Control:** `dropped 0` su entrambe le gerarchie HTB/`fq_codel` (`veth-n6` e `veth-n3`), con corrispondenza al singolo pacchetto tra policer XDP e classi Verde (`1:10`) / Gialla (`1:20`).
+
+* **Nota sul jitter del burst test su `veth`:** La fase burst da `~5–7 ms` può occasionalmente risentire del jitter dello scheduler software Python/kernel nella stima della durata d'invio. Le misure su `veth` fino a 60 Mbps validano la correttezza algoritmica, non le prestazioni di picco.
 
 ## ⚠️ Limiti Noti
 
-* **Stato per-CPU.** I TAT stanno in una `PerCpuHashMap`: ogni CPU ha il proprio bucket. Se i pacchetti di una stessa QER vengono distribuiti su più CPU, il rate aggregato può arrivare fino a *N × MBR*. I test sono stati eseguiti con un sender fissato a una CPU, quindi questo comportamento non è ancora misurato. In alternativa, dividere i rate per il numero di CPU limita un singolo flusso a *MBR / N*.
+* **Stato per-CPU:** I TAT risiedono in una `PerCpuHashMap`: ogni CPU ha il proprio bucket. Se i pacchetti di una stessa QER vengono distribuiti su $N$ CPU, il rate aggregato può raggiungere fino a $N \times \text{MBR}$. Al contrario, dividere i rate per $N$ limita un flusso su singolo core a $\text{MBR} / N$.
 
-* **Marcatura del verde in uplink.** Il verde non azzera il TOS: un pacchetto interno con TOS diverso da `0x00` e `0x38` finisce nella classe di default (gialla), e uno già a `0x38` risulta giallo anche se conforme.
+* **Classi HTB statiche rispetto a `update_qer`:** Il comando `update_qer` aggiorna istantaneamente i parametri Dual GCRA nel kernel XDP (policing e marcatura), ma le classi HTB del Traffic Control sulle interfacce di uscita restano ai limiti configurati all'avvio. Di conseguenza, ridurre l'MBR sotto il valore iniziale ha effetto immediato, mentre alzarlo oltre il ceil HTB resta limitato dallo shaper.
 
-* **Checksum IPv4 interno (uplink, giallo).** Il ricalcolo assume IHL = 5; il costo del pacchetto viene letto prima di verificare che l'IP interno sia IPv4.
+* **Marcatura del verde in uplink:** Il verde non azzera il TOS: un pacchetto interno con TOS diverso da `0x00` e `0x38` finisce nella classe di default (gialla), e uno già marcato `0x38` risulta giallo anche se conforme.
 
-* **Una istanza per direzione.** L'XDP è attaccato a una sola interfaccia, con mappe separate per istanza; UL e DL simultanei in un unico UPF non sono ancora supportati.
+* **Checksum IPv4 interno (uplink, giallo):** Il ricalcolo assume $\text{IHL} = 5$; la lunghezza del pacchetto viene letta prima di verificare che il pacchetto interno sia IPv4.
 
-* **Solo IPv4, MTU 1500, regole statiche.** Nessun PFCP, nessuna gestione del ciclo di vita delle sessioni; gli UE e i TEID sono inseriti dal control plane all'avvio.
+* **Solo IPv4, MTU 1500, Control Plane semplificato:** Il protocollo UDP/JSON emula le primitive di sessione 5G ma non implementa la codifica binaria completa del protocollo 3GPP PFCP né la gestione di IPv6.
 
-* **Log e eventi nel percorso caldo.** Le macro `info!` e l'evento su `RingBuf` per ogni pacchetto GTP-U alterano le misure di prestazione: vanno rimossi o campionati per i benchmark.
+* **Log ed eventi nel percorso caldo:** Le macro `info!` e la scrittura su `RingBuf` per ogni pacchetto GTP-U introducono overhead significativo e vanno rese opzionali o disattivate nei benchmark ad alto packet-rate.
 
-* **Overhead HTB fisso.** `--strip-bytes` sottrae un valore costante per pacchetto: non copre frame con VLAN o encapsulazioni diverse da quella prevista.
+* **Overhead HTB fisso:** `--strip-ul` / `--strip-dl` sottraggono un valore costante per pacchetto: non coprono frame con tag VLAN o encapsulazioni di lunghezza diversa da quella prevista.
 
 ## 🛣️ Roadmap e Traguardi
 
-* \[x\] Parsing base GTP-U in XDP ed eventi verso userspace via RingBuf.
+* \[x\] Parsing base GTP-U in XDP ed eventi verso userspace via `RingBuf`.
 
 * \[x\] Gestione PDR e FAR tramite mappe eBPF.
 
@@ -226,28 +280,30 @@ Le misure sono prese su veth con un generatore software e rate fino a 60 Mbps of
 
 * \[x\] **Incapsulazione Downlink:** stack IPv4/UDP/GTP con ricalcolo checksum e controllo MTU.
 
-* \[x\] **Inserimento dinamico del QFI:** Extension Header 0x85 in Downlink.
+* \[x\] **Inserimento dinamico del QFI:** Extension Header `0x85` in Downlink.
 
 * \[x\] **Rate Limiting QoS (trTCM):** Dual GCRA con *hard drop* per traffico rosso (MBR), in UL e DL.
 
 * \[x\] **Marcatura Dinamica (DSCP):** TOS `0x38` per il traffico giallo.
 
-* \[x\] **Traffic Control (TC) Shaping:** HTB con classi verde/gialla e filtri sul TOS.
+* \[x\] **Traffic Control (TC) Shaping:** HTB + `fq_codel` con classi verde/gialla e filtri `u32` sul TOS.
 
 * \[x\] **Allineamento delle unità:** HTB che misura solo l'IP interno (`stab overhead` negativo).
 
-* \[x\] **Test automatici UL e DL** con script Scapy/tcpdump e verifica dei contatori.
+* \[x\] **Test automatici UL e DL** con script Scapy/`tcpdump` e verifica dei contatori.
 
-* \[ \] Test multi-flusso e multi-CPU (comportamento aggregato del bucket per-CPU).
+* \[x\] **Control Plane Dinamico (Mini-PFCP):** listener asincrono Tokio UDP/JSON (`control.rs`) con aggiornamento thread-safe delle mappe a runtime (`add`, `update_qer`, `delete`) e suite di test live (`test_cp_live.py`).
 
-* \[ \] UL e DL contemporanei in un'unica istanza, con più QER in parallelo.
+* \[x\] **UPF Full-Duplex in un'unica istanza:** doppio attach XDP su `N3`/`N6` con dispatch su `IFACE_ROLE_MAP`, doppio shaper TC e contatori/tabelle separati per direzione (`COUNTERS_UL`/`DL`, `QFI_COUNTERS_UL`/`DL`).
+
+* \[ \] **Accelerazione `XDP_REDIRECT` (`bpf_fib_lookup`):** modalità `--fast-path` opzionale per bypassare lo stack IP Linux e confrontare le prestazioni rispetto al percorso `XDP_PASS + TC`.
+
+* \[ \] **Ottimizzazione hot-path per benchmark:** disattivazione condizionale (feature Cargo / flag) di `info!` e `RingBuf` per pacchetto.
+
+* \[ \] Aggiornamento dinamico delle classi HTB (`tc class change`) alla ricezione di `update_qer`.
+
+* \[ \] Test multi-flusso e multi-CPU (misura del comportamento aggregato del bucket per-CPU).
 
 * \[ \] Corpus di pacchetti malformati (GTP troncato, lunghezze incoerenti, message type diversi da 255, IPv6, opzioni IP).
 
-* \[ \] Ripetizione dei test e riferimento indipendente del GCRA (modello in Python sullo stesso flusso).
-
-* \[ \] Benchmark con TRex (pps, latenza, NIC reale).
-
-* \[ \] Integrazione con un control plane (es. PFCP) per modifiche dinamiche a runtime.
-
-* \[ \] Accelerazione XDP_REDIRECT (bypass dello stack IP Linux).
+* \[ \] Benchmark ad alte prestazioni con **TRex** (Mpps, throughput Gbps, latenza su NIC reale / DPDK).
