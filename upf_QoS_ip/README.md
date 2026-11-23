@@ -42,14 +42,14 @@ Lo userspace espone un **Control Plane asincrono su UDP/JSON** (porta standard P
 
   * Le code foglia sono configurate con **`fq_codel`** per contenere la latenza di accodamento e garantire equità sui flussi consentiti (in alternativa a `pfifo`, presente come opzione commentata).
 
-* **Allineamento delle Unità HTB (`--strip-bytes-ul` / `--strip-butes-dl`):** Il policer XDP conta l'IP interno, mentre l'HTB conta di default l'intero frame. Le opzioni `--strip-bytes-ul` (default **14 B**: Ethernet su N6) e           `--strip-bytes-dl` (default **58 B**: Ethernet + outer IP/UDP/GTP-U/Ext su N3) installano una size table `stab overhead -N` sulle rispettive qdisc root, allineando le misure tra XDP e TC. Impostando `0` si ottiene l'HTB standard.
+* **Allineamento delle Unità HTB (`--strip-bytes-ul` / `--strip-bytes-dl`):** Il policer XDP conta l'IP interno, mentre l'HTB conta di default l'intero frame. Le opzioni `--strip-bytes-ul` (default **14 B**: Ethernet su N6) e           `--strip-bytes-dl` (default **58 B**: Ethernet + outer IP/UDP/GTP-U/Ext su N3) installano una size table `stab overhead -N` sulle rispettive qdisc root, allineando le misure tra XDP e TC. Impostando `0` si ottiene l'HTB standard.
 
 * **Telemetria Separata e Report Tabellare:** Eventi per pacchetto GTP-U (`GtpPair`) tramite `RingBuf`; ogni 5 secondi e alla chiusura (`Ctrl+C`), lo userspace stampa una tabella affiancata (`Uplink | Downlink | Totale`) per i contatori XDP e per ogni QFI attivo, seguita dalle statistiche `tc -s class` di entrambe le interfacce di uscita.
 
 ## 🏗️ Architettura del Flusso
 
 ```
-                                                      [ Control Plane UDP/JSON ]
+                            [ Control Plane UDP/JSON ]
                          Tokio UdpSocket (127.0.0.1:8805)
                      add / update_qer / delete -> Arc<Mutex<Maps>>
                                         │
