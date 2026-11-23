@@ -21,9 +21,9 @@ use crate::control::{ControlState, FarAction::{Drop, Forward}, apply_command, ru
 
 #[derive(Debug, Parser)]
 struct Opt {
-    #[clap(short, long, default_value = "eth0")]
+    #[clap(long, default_value = "eth0")]
     iface_in: String,
-    #[clap(short, long)]
+    #[clap(long)]
     iface_out: String,
     #[clap(short, long)]
     mbr: u64,
@@ -180,18 +180,17 @@ async fn main() -> anyhow::Result<()> {
     };
     
     // REGOLE UPLINK
-    let _ = apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 9999, far_id: 1, far_action: Forward, outer_hdr_removed: true,
+    apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 9999, far_id: 1, far_action: Forward, outer_hdr_removed: true,
                                                                             qos: Some(control::QosParams {
-                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) });
-    let _ = apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 8888, far_id: 2, far_action: Drop, outer_hdr_removed: true,
-                                                                            qos: None });
+                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) })?;
+    apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 8888, far_id: 2, far_action: Drop, outer_hdr_removed: true,
+                                                                            qos: None })?;
     // REGOLA IN DOWNLINK
-    let _ = apply_command(&list_maps, control::ControlCommand::AddDownlink { ue_ip: Ipv4Addr::new(10, 60, 0, 1), far_id: 3, far_action: Forward,
+    apply_command(&list_maps, control::ControlCommand::AddDownlink { ue_ip: Ipv4Addr::new(10, 60, 0, 1), far_id: 3, far_action: Forward,
                                                                                 peer_ip: Ipv4Addr::new(10, 0, 3, 2), peer_teid: 7001,
                                                                                 local_ip: Ipv4Addr::new(10, 0, 3, 1), outer_hdr_creation: true, 
                                                                                 qos: Some(control::QosParams { 
-                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) });
-
+                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) })?;
 
     let socket = UdpSocket::bind(cp_addr).await?;
     let list_map_cp = list_maps.clone();

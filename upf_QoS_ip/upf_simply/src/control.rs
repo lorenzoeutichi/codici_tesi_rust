@@ -163,7 +163,7 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
         }
 
         ControlCommand::UpdateQer { qer_id, qfi, gbr_ul_mbps, mbr_ul_mbps, gbr_dl_mbps, mbr_dl_mbps, burst_bytes } => {
-            if qer_id != 0 && ((gbr_ul_mbps <= mbr_ul_mbps && mbr_ul_mbps > 0) || (gbr_dl_mbps <= mbr_dl_mbps && mbr_dl_mbps > 0 )) {
+            if qer_id != 0 && ((gbr_ul_mbps <= mbr_ul_mbps && gbr_dl_mbps <= mbr_dl_mbps) && (mbr_ul_mbps > 0 || mbr_dl_mbps > 0 )) {
                 if state.qer_state_map.lock().unwrap().get(&qer_id, 0).is_err() {
                     state.qer_state_map.lock().unwrap().insert(qer_id, zero_qer_state(state.num_cpus)?, 0)?;
                 } 
@@ -225,7 +225,7 @@ pub async  fn run_control_plane ( socket: UdpSocket, state: ControlState ) {
                             Ok(_) => {
                                 response = ControlResponse {
                                     ok: true,
-                                    message: format!("[CP]: Comando eseguito correttamente \n"),
+                                    message: format!("[CP]: Comando eseguito correttamente"),
                                 };
                             }
                             Err(e) => {
