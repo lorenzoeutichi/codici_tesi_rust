@@ -22,7 +22,7 @@ Lo userspace espone un **Control Plane asincrono su UDP/JSON** (porta standard P
 
 * **Gestione Extension Headers:** Decodifica iterativa in ingresso (Uplink), anche con catene di più extension header, ed emissione in uscita (Downlink) del container `0x85` (*PDU Session Container*) con il **QFI** letto dalla QER.
 
-* **Rate Limiting in XDP (trTCM / Dual GCRA, stato per-CPU):** Per ogni pacchetto si calcola il costo temporale $\text{lunghezza\_IP\_interno} \times \text{ns\_per\_byte}$ (in aritmetica a virgola fissa Q30) e si aggiornano due TAT (*Theoretical Arrival Time*), uno per il CIR (GBR) e uno per il PIR (MBR):
+* **Rate Limiting in XDP (trTCM / Dual GCRA, stato per-CPU):** Per ogni pacchetto si calcola il costo temporale `lunghezza_IP_interno × ns_per_byte` (in aritmetica a virgola fissa Q30) e si aggiornano due TAT (*Theoretical Arrival Time*), uno per il CIR (GBR) e uno per il PIR (MBR):
 
   * **Rosso (**$> \text{MBR}$**):** Il nuovo TAT di picco eccede la burst tolerance. XDP esegue `XDP_DROP`, senza aggiornare alcun TAT.
 
