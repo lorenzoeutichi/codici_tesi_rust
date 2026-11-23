@@ -4,7 +4,7 @@ use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
     CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, GtpPair, NO_QFI
 };
-use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count, count_qfi}, net::{ptr_at, ptr_at_mut}};
+use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count_ul, count_qfi_ul}, net::{ptr_at, ptr_at_mut}};
 
 
 #[inline(always)]
@@ -25,9 +25,9 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
         return Ok(XDP_PASS); 
     }
     if gtp.qfi != NO_QFI {
-        count_qfi(gtp.qfi);
+        count_qfi_ul(gtp.qfi);
     } else {
-        count(CNT_NO_QFI);
+        count_ul(CNT_NO_QFI);
     }
     match unsafe { UL_PDR_MAP.get(gtp.teid) } {
         None => {
@@ -42,18 +42,18 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
                     let inner_ip_pkt: *mut Ipv4Hdr = ptr_at_mut(ctx, gtp.payload_offset)?;
                     info!(ctx, "lunghezza pkt ip interno: {}", unsafe { (*inner_ip_pkt).tot_len()});
                     if police_ul(pdr.qer_id, inner_ip_pkt).is_err() { // gli devo passa la lunghezza del pkt ip 
-                        count(CNT_DROP_QOS);
+                        count_ul(CNT_DROP_QOS);
                         return Ok(XDP_DROP);
                     }
                     // decapsulazione
                     if pdr.outer_hdr_removed == 1 {
                         return decap_ul(ctx, gtp.payload_offset, eth_hdr_copy)
                     }
-                    count(CNT_FORWARD);  
+                    count_ul(CNT_FORWARD);  
                 }
             // FAR_DROP e qualsiasi valore sconosciuto
                 _ => {
-                    count(CNT_DROP_FAR);
+                    count_ul(CNT_DROP_FAR);
                     return Ok(XDP_DROP)
                 }
             },
@@ -67,14 +67,14 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
 fn police_ul(qer_id: u32, ip_pkt: *mut Ipv4Hdr) -> Result<u32, ()> {
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
-            count(CNT_NO_QER);
+            count_ul(CNT_NO_QER);
             return Ok(XDP_PASS);
         }
         Some(qer) => {
             
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
-                    count(CNT_NO_QER);
+                    count_ul(CNT_NO_QER);
                     return Ok(XDP_PASS) }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
@@ -151,8 +151,8 @@ fn decap_ul(ctx: &XdpContext, offset: usize, eth_hdr_copy: EthHdr) -> Result<u32
     let eth_header_mut: *mut EthHdr = ptr_at_mut(ctx, 0)?; // in realtà sono 14 byte di GTP-U
     unsafe { *eth_header_mut = eth_hdr_copy; } 
     
-    count(CNT_DECAP);
-    count(CNT_FORWARD);
+    count_ul(CNT_DECAP);
+    count_ul(CNT_FORWARD);
     Ok(XDP_PASS)
 }
 

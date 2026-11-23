@@ -1,5 +1,9 @@
 #![no_std]
 
+
+pub const IFACE_ROLE_RAN: u8 = 1;
+pub const IFACE_ROLE_DN: u8 = 2;
+
 #[repr(C)] // impone al compilatore Rust di allineare la memoria come farebbe un compilatore C
 #[derive(Clone, Copy, Debug)]
 pub struct GtpPair {
@@ -58,7 +62,6 @@ pub struct BucketParam {
     pub ns_per_byte: u64,
     pub burst_tolerance_ns: u64,
 }
-
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

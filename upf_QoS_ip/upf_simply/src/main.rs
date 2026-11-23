@@ -7,8 +7,7 @@ use log::{warn};
 use tokio::{net::UdpSocket, signal, sync::mpsc, time::Instant};
 use aya::maps::{RingBuf, HashMap, PerCpuArray};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, 
-    Far, GtpPair, NO_QFI, Pdr, Qer, QerState,
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, Far, GtpPair, IFACE_ROLE_DN, IFACE_ROLE_RAN, NO_QFI, Pdr, Qer, QerState,
 };
 use std::{net::Ipv4Addr, time::Duration};
 use std::process::Command;
@@ -22,18 +21,33 @@ use crate::control::{ControlState, FarAction::{Drop, Forward}, apply_command, ru
 #[derive(Debug, Parser)]
 struct Opt {
     #[clap(long, default_value = "eth0")]
-    iface_in: String,
+    iface_ran: String,
     #[clap(long)]
-    iface_out: String,
+    iface_dn: String,
     #[clap(short, long)]
-    mbr: u64,
+    mbr_dl: u64,
     #[clap(short, long)]
-    gbr: u64,
-    #[clap(long, default_value_t = 0)]
-    strip_bytes: u32,   // byte da non contare nell'HTB: 14 in UL, 58 in DL
+    gbr_dl: u64,
+    #[clap(short, long)]
+    mbr_ul: u64,
+    #[clap(short, long)]
+    gbr_ul: u64,
+    #[clap(long, default_value_t = 14)]
+    strip_bytes_ul: u32,
+    #[clap(long, default_value_t = 58)]
+    strip_bytes_dl: u32,   // byte da non contare nell'HTB: 14 in UL, 58 in DL
     #[clap(short, long, default_value = "127.0.0.1:8805")]
     cp_addr: String,
 
+}
+
+fn get_ifindex(iface: &str) -> anyhow::Result<u32> {
+    let path = format!("/sys/class/net/{iface}/ifindex");
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("impossibile leggere {path}: interfaccia '{iface}' inesistente?"))?;
+    return raw.trim()
+        .parse::<u32>()
+        .with_context(|| format!("ifindex non valido per '{iface}': {raw:?}"))
 }
 
 // funzione che invoca i comandi TC
@@ -107,11 +121,14 @@ fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, strip_bytes: u32) -> anyhow:
 async fn main() -> anyhow::Result<()> {
 
     let opt = Opt::parse();
-    let Opt { iface_in,
-            iface_out ,
-            mbr ,
-            gbr,
-            strip_bytes,
+    let Opt { iface_ran,
+            iface_dn ,
+            mbr_dl ,
+            gbr_dl,
+            mbr_ul,
+            gbr_ul,
+            strip_bytes_dl,
+            strip_bytes_ul,
             cp_addr,} = opt;
     env_logger::init();
     
@@ -151,9 +168,9 @@ async fn main() -> anyhow::Result<()> {
             let teid = hdr_gtp.teid;
             let qfi = hdr_gtp.qfi;
             if qfi != NO_QFI {
-                println!("Message Type: {} del TEID: {} con QFI: {}", msg, teid, qfi);
+                //println!("Message Type: {} del TEID: {} con QFI: {}", msg, teid, qfi);
             } else {
-                println!("Message Type: {} del TEID: {}", msg, teid);
+                // println!("Message Type: {} del TEID: {}", msg, teid);
             }
 
         }
@@ -182,7 +199,7 @@ async fn main() -> anyhow::Result<()> {
     // REGOLE UPLINK
     apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 9999, far_id: 1, far_action: Forward, outer_hdr_removed: true,
                                                                             qos: Some(control::QosParams {
-                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) })?;
+                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr_ul, mbr_mbps: mbr_ul, burst_bytes: 15_000 }) })?;
     apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 8888, far_id: 2, far_action: Drop, outer_hdr_removed: true,
                                                                             qos: None })?;
     // REGOLA IN DOWNLINK
@@ -190,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
                                                                                 peer_ip: Ipv4Addr::new(10, 0, 3, 2), peer_teid: 7001,
                                                                                 local_ip: Ipv4Addr::new(10, 0, 3, 1), outer_hdr_creation: true, 
                                                                                 qos: Some(control::QosParams { 
-                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr, mbr_mbps: mbr, burst_bytes: 15_000 }) })?;
+                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr_dl, mbr_mbps: mbr_dl, burst_bytes: 15_000 }) })?;
 
     let socket = UdpSocket::bind(cp_addr).await?;
     let list_map_cp = list_maps.clone();
@@ -198,21 +215,45 @@ async fn main() -> anyhow::Result<()> {
         run_control_plane(socket, list_map_cp).await
     });
 
+    let ifindex_ran = get_ifindex(&iface_ran)?;
+    let ifindex_dn = get_ifindex(&iface_dn)?;
+    anyhow::ensure!(
+        ifindex_ran != ifindex_dn,
+        "iface-n3 e iface-n6 devono essere due interfacce diverse"
+    );
+
+    let mut iface_role_map: HashMap<_, u32, u8> = HashMap::try_from(
+        ebpf.map_mut("IFACE_ROLE_MAP")
+            .context("mappa IFACE_ROLE_MAP non trovata")?,
+    )?;
+    iface_role_map.insert(ifindex_ran, IFACE_ROLE_RAN, 0)?;
+    iface_role_map.insert(ifindex_dn, IFACE_ROLE_DN, 0)?;
+
+    println!(
+        "Ruoli interfacce: {} (ifindex {}) -> RAN | {} (ifindex {}) -> DATA NETWORK",
+        iface_ran, ifindex_ran, iface_dn, ifindex_dn
+    );
 
     let program: &mut Xdp = ebpf.program_mut("upf_simply").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface_in, XdpMode::default())
+    program.attach(&iface_ran, XdpMode::default())
+        .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
+    program.attach(&iface_dn, XdpMode::default())
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
     // lo shaper va messo sull'interfaccia di USCITA del tunnel
-    let _ = setup_tc_shaper(&iface_out, mbr, gbr, strip_bytes);
+    let _ = setup_tc_shaper(&iface_dn, mbr_ul, gbr_ul, strip_bytes_ul);
+    let _ = setup_tc_shaper(&iface_ran, mbr_dl, gbr_dl, strip_bytes_dl);
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
 
     let mut ring_buf = RingBuf::try_from(ebpf.take_map("IP_EVENTS").unwrap()).expect("Errore nella ricerca della mappa"); 
-    let counters: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("COUNTERS").unwrap())?;
-    let qfi_counters: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("QFI_COUNTERS").unwrap())?;
+    let counters_dl: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("COUNTERS_DL").unwrap())?;
+    let counters_ul: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("COUNTERS_UL").unwrap())?;
+    let qfi_counters_dl: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("QFI_COUNTERS_DL").unwrap())?;
+    let qfi_counters_ul: PerCpuArray<aya::maps::MapData, u64> = PerCpuArray::try_from(ebpf.take_map("QFI_COUNTERS_UL").unwrap())?;
     let mut last_print = Instant::now();
+    let mut last_print_tc = Instant::now();
     loop {
         while let Some(item) = ring_buf.next() {
             // println!("Size ricevuta: {}", item.len());
@@ -231,27 +272,45 @@ async fn main() -> anyhow::Result<()> {
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 if last_print.elapsed() >= Duration::from_secs(5) {
-                    println!("---XDP POLICING REPORT----");
-                    let _ = print_qfi(&qfi_counters);
-                    let _ = print_counters(&counters);
-
-                    println!("\n--- TC SHAPING REPORT ---");
-                    let _ = print_tc_stats(&iface_out);
-                    println!("-----------");
+                    println!("\n---XDP POLICING REPORT----");
+                    let _ = print_qfi(&qfi_counters_ul, &qfi_counters_dl);
+                    let _ = print_counters(&counters_ul, &counters_dl);
                     last_print = tokio::time::Instant::now();
+                    
+                    if last_print_tc.elapsed() >= Duration::from_secs(30) {
+                    println!("\n--- TC UPLINK SHAPING REPORT ---");
+                    let _ = print_tc_stats(&iface_dn);
+                    println!("\n--- TC DOWNLINK SHAPING REPORT ---");
+                    let _ = print_tc_stats(&iface_ran); 
+                    last_print_tc = tokio::time::Instant::now();
+                    }
+                    println!("-----------");
                 }  
+                  
             }
         }
     }
-    println!("---FINAL REPORT----");
-    let _ = print_qfi(&qfi_counters);
-    let _ = print_counters(&counters);
-    let _ = print_tc_stats(&iface_out);
+    println!("\n---FINAL REPORT----");
+    println!("\n---XDP POLICING REPORT----");
+    let _ = print_qfi(&qfi_counters_ul, &qfi_counters_dl);
+    let _ = print_counters(&counters_ul, &counters_dl);
+    println!("\n--- TC UPLINK SHAPING REPORT ---");
+    let _ = print_tc_stats(&iface_dn);
+    println!("\n--- TC DOWNLINK SHAPING REPORT ---");
+    let _ = print_tc_stats(&iface_ran);
     println!("-----------");
     Ok(())
 }
 
-fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()> {
+fn sum_per_cpu(map: &PerCpuArray<aya::maps::MapData, u64>, idx: u32) -> anyhow::Result<u64> {
+    let per_cpu = map.get(&idx, 0)?;
+    Ok(per_cpu.iter().sum())
+}
+
+fn print_counters(
+    ul: &PerCpuArray<aya::maps::MapData, u64>,
+    dl: &PerCpuArray<aya::maps::MapData, u64>,
+) -> anyhow::Result<()> {
     let voci = [
         (CNT_FORWARD, "forward"),
         (CNT_DECAP, "pkts decapsulati"),
@@ -263,24 +322,60 @@ fn print_counters(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()
         (CNT_NO_QER, "nessuna QER"),
         (CNT_NO_QFI, "nessuna QFI"),
         (CNT_ERR_INNER_IPV4, "inner pkt not ipv4"),
-        (CNT_ERR, "general pkt errors:"),
-        
+        (CNT_ERR, "general pkt errors"),
     ];
+
+    let sep = "-".repeat(59);
+    println!("{sep}");
+    println!(
+        "{:<20} | {:>10} | {:>10} | {:>10}",
+        "Contatore", "Uplink", "Downlink", "Totale"
+    );
+    println!("{sep}");
+
     for (idx, nome) in voci {
-        let per_cpu = c.get(&idx, 0)?; // un valore per CPU
-        let totale: u64 = per_cpu.iter().sum();
-        println!("{nome:>12}: {totale}");   
+        let val_ul = sum_per_cpu(ul, idx)?;
+        let val_dl = sum_per_cpu(dl, idx)?;
+        let tot = val_ul + val_dl;
+        println!("{nome:<20} | {val_ul:>10} | {val_dl:>10} | {tot:>10}");
     }
+
+    println!("{sep}");
     Ok(())
 }
 
-fn print_qfi(c: &PerCpuArray<aya::maps::MapData, u64>) -> anyhow::Result<()> {
+fn print_qfi(
+    qfi_ul: &PerCpuArray<aya::maps::MapData, u64>,
+    qfi_dl: &PerCpuArray<aya::maps::MapData, u64>,
+) -> anyhow::Result<()> {
+    let sep = "-".repeat(59);
+    let mut printed_header = false;
+
     for idx in 0..64 {
-        let per_cpu = c.get(&idx, 0)?;
-        let totale: u64 = per_cpu.iter().sum();
-        if totale > 0 {
-            println!("QFI: {}: {}", idx, totale)
+        let val_ul = sum_per_cpu(qfi_ul, idx)?;
+        let val_dl = sum_per_cpu(qfi_dl, idx)?;
+        if val_ul == 0 && val_dl == 0 {
+            continue;
         }
+
+        if !printed_header {
+            println!("{sep}");
+            println!(
+                "{:<20} | {:>10} | {:>10} | {:>10}",
+                "QFI", "Uplink", "Downlink", "Totale"
+            );
+            println!("{sep}");
+            printed_header = true;
+        }
+
+        let tot = val_ul + val_dl;
+        println!("{idx:<20} | {val_ul:>10} | {val_dl:>10} | {tot:>10}");
+    }
+
+    if printed_header {
+        println!("{sep}");
+    } else {
+        println!("(nessun traffico QFI)");
     }
     Ok(())
 }
@@ -291,7 +386,6 @@ fn print_tc_stats(iface: &str) {
         .output()
     {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("--- STATISTICHE TC SHAPER (HTB) ---");
         // Filtriamo le righe vuote per mantenere il terminale pulito
         for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
             println!("{}", line);

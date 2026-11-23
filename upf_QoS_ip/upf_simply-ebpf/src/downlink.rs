@@ -2,7 +2,7 @@ use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, udp::UdpHdr};
 use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, FAR_FORWARD, Far, NO_QFI};
-use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count, count_qfi}, net::{Ipv4Info, ptr_at_mut}};
+use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count_dl, count_qfi_dl}, net::{Ipv4Info, ptr_at_mut}};
 
 
 
@@ -12,17 +12,17 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
     match unsafe { DL_PDR_MAP.get(&ip.ip_dst)} {
         None => {
             info!(ctx, "nessuna PDR per tale UE ip: {}", ip.ip_dst);
-            count(CNT_NO_PDR);
+            count_dl(CNT_NO_PDR);
             return Ok(XDP_PASS)
         }
 
         Some(pdr) => {
             let mut qfi = NO_QFI;
             match unsafe { QER_MAP.get(&pdr.qer_id)} {
-                None => count(CNT_NO_QFI),
+                None => count_dl(CNT_NO_QFI),
                 Some(qer) => {
                     qfi = qer.qfi;
-                    count_qfi(qfi);
+                    count_qfi_dl(qfi);
                 }
             }
             match unsafe {FAR_MAP.get(&pdr.far_id)} {
@@ -33,17 +33,17 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                         let is_yellow = match police_dl(pdr.qer_id, ip.total_length) {
                             Ok(yellow_flag) => yellow_flag,
                             Err(_) => {
-                                count(CNT_DROP_QOS);
+                                count_dl(CNT_DROP_QOS);
                                 return Ok(XDP_DROP)
                             } 
                         };
                         if far.outer_hdr_creation == 1 {
                             return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi, is_yellow)
                         }
-                        count(CNT_FORWARD);
+                        count_dl(CNT_FORWARD);
                     }
                     _ => {
-                        count(CNT_DROP_FAR);
+                        count_dl(CNT_DROP_FAR);
                         return Ok(XDP_DROP)
                     }
 
@@ -58,14 +58,14 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 fn police_dl(qer_id: u32, ip_tot_length: u16) -> Result<bool, ()> {
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
-            count(CNT_NO_QER);
+            count_dl(CNT_NO_QER);
             return Ok(false);
         }
         Some(qer) => {
 
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
-                    count(CNT_NO_QER);
+                    count_dl(CNT_NO_QER);
                     return Ok(false) }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
@@ -172,8 +172,8 @@ fn encap_dl (ctx: &XdpContext, total_length: u16, far: &Far, eth_hdr_original: E
     unsafe {(*ip_hdr).set_checksum(checksum_ipv4hdr(ip_hdr)) }; 
     info!(ctx, "pkt ip incapsulato correttamente in un GTP-U");
 
-    count(CNT_FORWARD);
-    count(CNT_ENCAP);
+    count_dl(CNT_FORWARD);
+    count_dl(CNT_ENCAP);
     Ok(XDP_PASS)
 }
 

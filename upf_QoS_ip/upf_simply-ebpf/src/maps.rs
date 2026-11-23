@@ -1,6 +1,9 @@
 use aya_ebpf::{macros::map, maps::{HashMap, PerCpuArray, PerCpuHashMap, RingBuf}};
 use upf_simply_common::{CNT_MAX, Far, N_CONT, Pdr, Qer, QerState};
 
+
+#[map]
+pub(crate) static IFACE_ROLE_MAP: HashMap<u32, u8> = HashMap::with_max_entries(16, 0);
 #[map]
 pub(crate) static IP_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
@@ -14,20 +17,36 @@ pub(crate) static QER_STATE_MAP: PerCpuHashMap<u32, QerState> = PerCpuHashMap::w
 #[map]
 pub(crate) static DL_PDR_MAP: HashMap<u32, Pdr> = HashMap::with_max_entries(1024, 0); // chiave UE IP
 #[map]
-static COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(CNT_MAX, 0);
+static COUNTERS_UL: PerCpuArray<u64> = PerCpuArray::with_max_entries(CNT_MAX, 0);
 #[map]
-static QFI_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_CONT, 0); // indice QFI
+static COUNTERS_DL: PerCpuArray<u64> = PerCpuArray::with_max_entries(CNT_MAX, 0);
+#[map]
+static QFI_COUNTERS_DL: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_CONT, 0); // indice QFI
+#[map]
+static QFI_COUNTERS_UL: PerCpuArray<u64> = PerCpuArray::with_max_entries(N_CONT, 0); // indice QFI
 
 #[inline(always)]
-pub(crate) fn count(idx: u32) {
-    if let Some(c) = COUNTERS.get_ptr_mut(idx) {
+pub(crate) fn count_dl(idx: u32) {
+    if let Some(c) = COUNTERS_DL.get_ptr_mut(idx) {
+        unsafe { *c += 1 };
+    }
+}
+#[inline(always)]
+pub(crate) fn count_ul(idx: u32) {
+    if let Some(c) = COUNTERS_UL.get_ptr_mut(idx) {
         unsafe { *c += 1 };
     }
 }
 
 #[inline(always)]
-pub(crate) fn count_qfi(idx: u8) {
-    if let Some(c) = QFI_COUNTERS.get_ptr_mut(idx.into()) {
+pub(crate) fn count_qfi_dl(idx: u8) {
+    if let Some(c) = QFI_COUNTERS_DL.get_ptr_mut(idx.into()) {
+        unsafe { *c += 1 };
+    }
+}
+#[inline(always)]
+pub(crate) fn count_qfi_ul(idx: u8) {
+    if let Some(c) = QFI_COUNTERS_UL.get_ptr_mut(idx.into()) {
         unsafe { *c += 1 };
     }
 }
