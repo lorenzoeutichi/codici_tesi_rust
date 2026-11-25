@@ -242,7 +242,6 @@ sudo taskset -c 2 ip netns exec ns-gnb python3 scripts/upf_ul_selftest.py \
   --mbr 20 --gbr 10 --non-qos-rate 10 --tc-if veth-n6 \
   --green-class 1:21 --yellow-class 1:22 --non-qos-class 1:42 \
   --burst-bytes 15000 --htb-overhead 0
-
 ```
 
 **Downlink** (dentro `ns-dn`, cattura in `ns-gnb`):
@@ -252,14 +251,21 @@ sudo taskset -c 3 ip netns exec ns-dn python3 scripts/upf_dl_selftest.py \
   --mbr 20 --gbr 10 --non-qos-rate 10 --tc-if veth-n3 \
   --green-class 1:21 --yellow-class 1:22 --non-qos-class 1:42 \
   --burst-bytes 15000 --htb-overhead 0
+```
+**Nota per test Full-Duplex / esecuzione parallela UL + DL (UDP Sink in `ns-dn`):**
+Quando si eseguono i test Uplink e Downlink contemporaneamente, i pacchetti UDP decapsulati che raggiungono `ns-dn` sulla porta `5000` senza alcun processo in ascolto inducono il kernel a generare risposte `ICMP Port Unreachable` verso `10.60.0.1`. Poiché tale indirizzo corrisponde alla PDR Downlink attiva su `veth-n6`, questi pacchetti ICMP rientrano nella UPF, consumano token dal bucket Downlink e sporcano i contatori delle classi TC (`1:21`) durante le verifiche di isolamento.
+
+Per evitarlo, avviare un semplice sink UDP in background dentro `ns-dn` prima di lanciare le suite in parallelo:
 
 ```
+sudo ip netns exec ns-dn nc -ul 5000 >/dev/null &
+```
+Al termine dei test è possibile terminarlo con `sudo pkill -f "nc -ul 5000"`.
 
 **Control Plane Dinamico Live & Multi-Classe 5QI** (sull'host):
 
 ```
 sudo python3 scripts/test_cp_live.py --mbr-ul 20 --gbr-ul 10 --non-qos-rate 10 --ef-rate 20
-
 ```
 
 | Suite / Fase | Verifica | 
