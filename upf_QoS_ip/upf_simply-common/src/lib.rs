@@ -46,6 +46,10 @@ pub const FAR_FORWARD: u8 = 1;
 #[derive(Clone, Copy, Debug)]
 pub struct Qer {
     pub qfi: u8,
+    pub five_qi: u8,
+    pub dscp_green: u8,
+    pub dscp_yellow: u8,
+    pub _pad: [u8; 4],
     pub cir_ul: BucketParam,
     pub pir_ul: BucketParam,
     pub cir_dl: BucketParam,
@@ -91,6 +95,12 @@ unsafe impl aya::Pod for BucketParam {}
 pub const DSCP_BE: u8 = 0;
 pub const DSCP_AF11: u8 = 10;
 pub const DSCP_AF13: u8 = 14;
+pub const DSCP_EF: u8 = 46;
+pub const DSCP_CS5: u8 = 40;
+pub const DSCP_AF41: u8 = 34;
+pub const DSCP_AF43: u8 = 38;
+pub const DSCP_AF31: u8 = 26;
+pub const DSCP_AF33: u8 = 30;
 
 
 pub const CNT_FORWARD: u32 = 0;

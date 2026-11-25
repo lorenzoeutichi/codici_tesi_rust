@@ -40,6 +40,10 @@ struct Opt {
     strip_bytes_dl: u32,   // byte da non contare nell'HTB: 14 in UL, 58 in DL
     #[clap(short, long, default_value = "127.0.0.1:8805")]
     cp_addr: String,
+    #[clap(long, default_value_t = 100)]
+    link_rate: u64,
+    #[clap(long, default_value_t = 20)]
+    ef_rate: u64,
 
 }
 
@@ -53,54 +57,90 @@ fn get_ifindex(iface: &str) -> anyhow::Result<u32> {
 }
 
 // funzione che invoca i comandi TC
-fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, non_qos_rate: u64, strip_bytes: u32) -> anyhow::Result<()> {
+fn setup_tc_shaper(iface: &str, mbr: u64, gbr: u64, non_qos_rate: u64, link_rate: u64, ef_rate: u64, strip_bytes: u32) -> anyhow::Result<()> {
     let mbr_bps = mbr * 1_000_000;
     let gbr_bps = gbr * 1_000_000;
     let non_qos_rate_bps = non_qos_rate * 1_000_000;
+    let link_rate_bps = link_rate * 1_000_000;
+    let ef_rate_bps = ef_rate * 1_000_000;
     println!("Configurazione Traffic Control (HTB Shaper) su {} (MBR: {} Mbps, GBR: {} Mbps, Non-GBR: {} Mbps)...", iface, mbr, gbr, non_qos_rate);
 
     // Formattazione per tc (es. "100000000bit")
     let mbr_str = format!("{}bit", mbr_bps);
     let gbr_str = format!("{}bit", gbr_bps);
     let non_gbr_str = format!("{}bit", non_qos_rate_bps);
+    let link_rate_str = format!("{}bit", link_rate_bps);
+    let ef_rate_str = format!("{}bit", ef_rate_bps);
     
-    // Assegniamo una rate minima di sussistenza alla coda Gialla (es. 1% dell'MBR) 
+    // Assegniamo una rate minima di sussistenza alla coda Gialla QoS (es. 1% dell'MBR) 
     // per rispettare i vincoli di HTB senza rubare banda al GBR.
     let base_yellow_rate = std::cmp::max(mbr_bps / 100, 1000);
     let excess_str = format!("{}bit", base_yellow_rate);
 
+    // Assegniamo una rate minima di sussistenza alla coda Gialla Non-qos (es. 1% dell'MBR del Non-QoS) 
+    // per rispettare i vincoli di HTB senza rubare banda al GBR.
+    let non_qos_base_yellow_rate = std::cmp::max(non_qos_rate_bps / 100, 1000);
+    let non_qos_excess_str = format!("{}bit", non_qos_base_yellow_rate);
+
     let commands = [
         format!("tc qdisc del dev {} root", iface),
         if strip_bytes > 0 {
-            format!("tc qdisc add dev {} root handle 1: stab overhead -{} linklayer ethernet htb default 30",
+            format!("tc qdisc add dev {} root handle 1: stab overhead -{} linklayer ethernet htb default 42",
             iface, strip_bytes)
         } else {
-            format!("tc qdisc add dev {} root handle 1: htb default 30", iface)
+            format!("tc qdisc add dev {} root handle 1: htb default 42", iface)
         },
         
         // QoS Shaper
-        // Classe Padre limitata all'MBR globale
-        format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {} burst 15000b cburst 15000b", iface, mbr_str, mbr_str),
-        // Coda Verde (1:10) - Banda Garantita pari al GBR
-        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b cburst 15000b prio 0", iface, gbr_str, mbr_str),
-        // Coda Gialla (1:20) - Banda base minima, tetto pari all'MBR
-        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b prio 1", iface, excess_str, mbr_str),
+        // Classe Padre limitata alla banda fisica 
+        format!("tc class add dev {} parent 1: classid 1:1 htb rate {} ceil {} burst 15000b cburst 15000b", iface, link_rate_str, link_rate_str),
+
+        // Classe 1 - Real-Time (1:10)
+        format!("tc class add dev {} parent 1:1 classid 1:10 htb rate {} ceil {} burst 15000b cburst 15000b prio 0", iface, ef_rate_str, ef_rate_str),
+
+        // Classe 2 - Conversation / MC video (1:20)
+        format!("tc class add dev {} parent 1:1 classid 1:20 htb rate {} ceil {} burst 15000b cburst 15000b", iface, mbr_str, mbr_str),
+        // Coda Verde (1:21)
+        format!("tc class add dev {} parent 1:20 classid 1:21 htb rate {} ceil {} burst 15000b cburst 15000b prio 1", iface, gbr_str, mbr_str),
+        // Coda Gialla (1:22)
+        format!("tc class add dev {} parent 1:20 classid 1:22 htb rate {} ceil {} burst 15000b cburst 15000b prio 2", iface, excess_str, mbr_str),
+
+        // Classe 3 - Bufferd Video / MC data (1:30)
+        format!("tc class add dev {} parent 1:1 classid 1:30 htb rate {} ceil {} burst 15000b cburst 15000b", iface, mbr_str, mbr_str),
+        // Coda Verde (1:31)
+        format!("tc class add dev {} parent 1:30 classid 1:31 htb rate {} ceil {} burst 15000b cburst 15000b prio 3", iface, gbr_str, mbr_str),
+        // Coda Gialla (1:32)
+        format!("tc class add dev {} parent 1:30 classid 1:32 htb rate {} ceil {} burst 15000b cburst 15000b prio 4", iface, excess_str, mbr_str),
+
 
         // Non-QoS Shaper
-        // Coda Non-QoS (1:30) - Best Effort 
-        format!("tc class add dev {} parent 1: classid 1:30 htb rate {} ceil {} burst 15000b cburst 15000b prio 2", iface, non_gbr_str, non_gbr_str),
+        // Classe 4 - Non-GBR / Best Effort (1:40)
+        format!("tc class add dev {} parent 1: classid 1:40 htb rate {} ceil {} burst 15000b cburst 15000b", iface, non_gbr_str, non_gbr_str),
+        // Coda Verde (1:41)
+        format!("tc class add dev {} parent 1:40 classid 1:41 htb rate {} ceil {} burst 15000b cburst 15000b prio 5", iface,non_qos_excess_str, non_gbr_str),
+        // Coda Gialla (1:42)
+        format!("tc class add dev {} parent 1:40 classid 1:42 htb rate {} ceil {} burst 15000b cburst 15000b prio 6", iface, non_qos_excess_str, non_gbr_str),
         
         // Classi foglia fq_codel per assicurare che il traffico consentito venga consegnato con la massima equità e la minima latenza possibile.
         format!("tc qdisc add dev {} parent 1:10 handle 10: fq_codel", iface),
-        format!("tc qdisc add dev {} parent 1:20 handle 20: fq_codel", iface),
-        format!("tc qdisc add dev {} parent 1:30 handle 30: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:21 handle 21: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:22 handle 22: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:31 handle 31: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:32 handle 32: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:41 handle 41: fq_codel", iface),
+        format!("tc qdisc add dev {} parent 1:42 handle 42: fq_codel limit 200", iface),
         // Sotto-code FIFO rigidissime per forzare il Tail Drop
         // format!("tc qdisc add dev {} parent 1:10 handle 10: pfifo limit 100", iface),
         // format!("tc qdisc add dev {} parent 1:20 handle 20: pfifo limit 100", iface),
 
-        format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0x28 0xfc flowid 1:10", iface),
-        format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0x38 0xfc flowid 1:20", iface),
-        format!("tc filter add dev {} protocol ip parent 1:0 prio 3 u32 match ip tos 0x00 0xfc flowid 1:30", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 1 u32 match ip tos 0xB8 0xfc flowid 1:10", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 2 u32 match ip tos 0xA0 0xfc flowid 1:10", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 3 u32 match ip tos 0x88 0xfc flowid 1:21", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 4 u32 match ip tos 0x98 0xfc flowid 1:22", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 5 u32 match ip tos 0x68 0xfc flowid 1:31", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 6 u32 match ip tos 0x78 0xfc flowid 1:32", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 7 u32 match ip tos 0x28 0xfc flowid 1:41", iface),
+        format!("tc filter add dev {} protocol ip parent 1:0 prio 8 u32 match ip tos 0x00 0xfc flowid 1:42", iface),
     ];
 
     for cmd_str in commands.iter() {
@@ -139,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
             non_qos_rate,
             strip_bytes_dl,
             strip_bytes_ul,
-            cp_addr,} = opt;
+            cp_addr,
+            link_rate,
+            ef_rate} = opt;
     env_logger::init();
     
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -209,7 +251,7 @@ async fn main() -> anyhow::Result<()> {
     // REGOLE UPLINK
     apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 9999, far_id: 1, far_action: Forward, outer_hdr_removed: true,
                                                                             qos: Some(control::QosParams {
-                                                                                qer_id: 1, qfi: 5, gbr_mbps: gbr_ul, mbr_mbps: mbr_ul, burst_bytes: 15_000 }) })?;
+                                                                                five_qi: Some(2), qer_id: 1, qfi: 5, gbr_mbps: gbr_ul, mbr_mbps: mbr_ul, burst_bytes: 15_000 }) })?;
     apply_command(&list_maps, control::ControlCommand::AddUplink { teid: 8888, far_id: 2, far_action: Drop, outer_hdr_removed: true,
                                                                             qos: None })?;
     // REGOLA IN DOWNLINK
@@ -217,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
                                                                                 peer_ip: Ipv4Addr::new(10, 0, 3, 2), peer_teid: 7001,
                                                                                 local_ip: Ipv4Addr::new(10, 0, 3, 1), outer_hdr_creation: true, 
                                                                                 qos: Some(control::QosParams { 
-                                                                                    qer_id: 2, qfi: 5, gbr_mbps: gbr_dl, mbr_mbps: mbr_dl, burst_bytes: 15_000 }) })?;
+                                                                                    five_qi: Some(2), qer_id: 2, qfi: 5, gbr_mbps: gbr_dl, mbr_mbps: mbr_dl, burst_bytes: 15_000 }) })?;
 
     let socket = UdpSocket::bind(cp_addr).await?;
     let list_map_cp = list_maps.clone();
@@ -252,8 +294,8 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
     // lo shaper va messo sull'interfaccia di USCITA del tunnel
-    let _ = setup_tc_shaper(&iface_dn, mbr_ul, gbr_ul, non_qos_rate, strip_bytes_ul);
-    let _ = setup_tc_shaper(&iface_ran, mbr_dl, gbr_dl, non_qos_rate, strip_bytes_dl);
+    let _ = setup_tc_shaper(&iface_dn, mbr_ul, gbr_ul, non_qos_rate, link_rate, ef_rate, strip_bytes_ul);
+    let _ = setup_tc_shaper(&iface_ran, mbr_dl, gbr_dl, non_qos_rate, link_rate, ef_rate, strip_bytes_dl);
 
     println!("In ascolto dei pacchetti..... Premi Ctrl +C per uscire");
 

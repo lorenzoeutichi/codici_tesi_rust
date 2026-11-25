@@ -6,9 +6,9 @@ use upf_simply_common::CNT_ERR;
 
 
 pub enum EsitoPolicing {
-    NonQos,
-    Green,
-    Yellow,
+    NonQos(u8),
+    Green(u8),
+    Yellow(u8),
     Red,
 }
 

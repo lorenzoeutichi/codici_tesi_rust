@@ -2,6 +2,14 @@ use std::net::Ipv4Addr;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::net::UdpSocket;
+use upf_simply_common::DSCP_AF11;
+use upf_simply_common::DSCP_AF31;
+use upf_simply_common::DSCP_AF33;
+use upf_simply_common::DSCP_AF41;
+use upf_simply_common::DSCP_AF43;
+use upf_simply_common::DSCP_BE;
+use upf_simply_common::DSCP_CS5;
+use upf_simply_common::DSCP_EF;
 use upf_simply_common::{BucketParam, FAR_DROP, FAR_FORWARD, Far, Pdr, Qer, QerState};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,6 +24,19 @@ fn default_true() -> bool {
     true
 }
 
+fn resolve_five_qi(five_qi: Option<u8>, mbr: u64) -> u8 {
+    match five_qi {
+        Some(val) => val,
+        None => {
+            if mbr > 0 {
+                2 // Default QoS GBR: Conversational Video (AF41 / AF43)
+            } else {
+                9 // Default Non-GBR: Best-Effort (CS0)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FarAction {
@@ -26,6 +47,8 @@ pub enum FarAction {
 
 #[derive(Debug, Deserialize)]
 pub struct QosParams {
+    #[serde(default)]
+    pub five_qi: Option<u8>,
     pub qer_id: u32,
     pub qfi: u8,
     pub gbr_mbps: u64,
@@ -73,6 +96,8 @@ pub enum ControlCommand {
     },
 
     UpdateQer {
+        #[serde(default)]
+        five_qi: Option<u8>,
         qer_id: u32,
         qfi: u8,
         #[serde(default)]
@@ -105,17 +130,35 @@ struct ControlResponse {
 pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Result<()> {
 
     match cmd {
-
         ControlCommand::AddUplink { teid, far_id, far_action, outer_hdr_removed, qos } => {
             let qer_id;
             match qos {
                 Some(q) => {
+                    if q.qfi > 63 {
+                        anyhow::bail!("QFI non valido (deve essere <= 63)")
+                    }
+                    let five_qi = match resolve_five_qi(q.five_qi, q.mbr_mbps) {
+                        val => {
+                            if matches!(val, 1 | 3 | 65 | 82..=85) && (q.gbr_mbps != q.mbr_mbps || q.mbr_mbps == 0) {
+                                anyhow::bail!("5QI = EF => gbr = mbr")
+                            }
+                            if matches!(val, 5 | 6 | 7 | 8 | 9 | 69) && q.gbr_mbps != 0 {
+                                anyhow::bail!("5QI Non-GBR deve avere gbr = 0")
+                            }
+                            if matches!(val, 2 | 4 | 66 | 67) && q.gbr_mbps == 0 && q.mbr_mbps > 0 {
+                                anyhow::bail!("5QI GBR deve avere gbr > 0 se mbr > 0");
+                            }
+                            val
+                        }
+                    };
+                    let (dscp_green, dscp_yellow) = map_5qi_to_dscp(five_qi)?;
                     if q.qer_id != 0 && q.gbr_mbps <= q.mbr_mbps {
                         if q.mbr_mbps > 0 && q.burst_bytes < 1500 {
                             anyhow::bail!("burst_bytes deve essere >= 1500")
                         }
                         state.qer_state_map.lock().unwrap().insert(q.qer_id, zero_qer_state(state.num_cpus)?, 0)?;
-                        state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, cir_ul: make_bucket(q.gbr_mbps, q.burst_bytes, state.cpu_div),
+                        state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, five_qi: five_qi, dscp_green: dscp_green, dscp_yellow: dscp_yellow, _pad: [0; 4],
+                                                                                        cir_ul: make_bucket(q.gbr_mbps, q.burst_bytes, state.cpu_div),
                                                                                         pir_ul: make_bucket(q.mbr_mbps, q.burst_bytes, state.cpu_div),
                                                                                         cir_dl: make_bucket(0, q.burst_bytes, state.cpu_div),
                                                                                         pir_dl: make_bucket(0, q.burst_bytes, state.cpu_div)},                                                                                    
@@ -135,17 +178,35 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
             state.ul_pdr_map.lock().unwrap().insert(teid, Pdr{ far_id: far_id, qer_id: qer_id, 
                                                                         outer_hdr_removed: outer_hdr_removed.into(), _pad: [0; 3]}, 0)?;
         }
-
         ControlCommand::AddDownlink { ue_ip, far_id, far_action, peer_ip, peer_teid, local_ip, outer_hdr_creation, qos } => {
             let qer_id;
             match qos {
                 Some(q) => {
+                    if q.qfi > 63 {
+                        anyhow::bail!("QFI non valido (deve essere <= 63)")
+                    }
+                    let five_qi = match resolve_five_qi(q.five_qi, q.mbr_mbps) {
+                        val => {
+                            if matches!(val, 1 | 3 | 65 | 82..=85) && (q.gbr_mbps != q.mbr_mbps || q.mbr_mbps == 0) {
+                                anyhow::bail!("5QI = EF => gbr = mbr")
+                            }
+                            if matches!(val, 5 | 6 | 7 | 8 | 9 | 69) && q.gbr_mbps != 0 {
+                                anyhow::bail!("5QI Non-GBR deve avere gbr = 0")
+                            }
+                            if matches!(val, 2 | 4 | 66 | 67) && q.gbr_mbps == 0 && q.mbr_mbps > 0 {
+                                anyhow::bail!("5QI GBR deve avere gbr > 0 se mbr > 0");
+                            }
+                            val
+                        }
+                    };
+                    let (dscp_green, dscp_yellow) = map_5qi_to_dscp(five_qi)?;
                     if q.qer_id != 0 && q.gbr_mbps <= q.mbr_mbps {
                         if q.mbr_mbps > 0 && q.burst_bytes < 1500 {
                             anyhow::bail!("burst-bytes deve essere >= 1500")
                         }
                         state.qer_state_map.lock().unwrap().insert(q.qer_id, zero_qer_state(state.num_cpus)?, 0)?;
-                        state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, cir_ul: make_bucket(0, q.burst_bytes, state.cpu_div),
+                        state.qer_map.lock().unwrap().insert(q.qer_id, Qer {qfi: q.qfi, five_qi: five_qi, dscp_green: dscp_green, dscp_yellow: dscp_yellow, _pad: [0;4],
+                                                                                        cir_ul: make_bucket(0, q.burst_bytes, state.cpu_div),
                                                                                         pir_ul: make_bucket(0, q.burst_bytes, state.cpu_div),
                                                                                         cir_dl: make_bucket(q.gbr_mbps, q.burst_bytes, state.cpu_div),
                                                                                         pir_dl: make_bucket(q.mbr_mbps, q.burst_bytes, state.cpu_div)},                                                                                    
@@ -167,8 +228,28 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
                                                                         outer_hdr_removed: 0, _pad: [0; 3]}, 0)?;
             
         }
-
-        ControlCommand::UpdateQer { qer_id, qfi, gbr_ul_mbps, mbr_ul_mbps, gbr_dl_mbps, mbr_dl_mbps, burst_bytes } => {
+        ControlCommand::UpdateQer { five_qi, qer_id, qfi, gbr_ul_mbps, mbr_ul_mbps, gbr_dl_mbps, mbr_dl_mbps, burst_bytes } => {
+            if qfi > 63 {
+                anyhow::bail!("QFI non valido (deve essere <= 63)")
+            }
+            let five_qi = match resolve_five_qi(five_qi, mbr_ul_mbps.max(mbr_dl_mbps)) {
+                val => {
+                    if matches!(val, 1 | 3 | 65 | 82..=85) && ((mbr_ul_mbps == 0 && mbr_dl_mbps == 0) || gbr_ul_mbps != mbr_ul_mbps || gbr_dl_mbps != mbr_dl_mbps) {
+                        anyhow::bail!("5QI = EF => gbr = mbr")
+                    }
+                    if matches!(val, 5 | 6 | 7 | 8 | 9 | 69) && (gbr_dl_mbps != 0 || gbr_ul_mbps != 0) {
+                        anyhow::bail!("5QI Non-GBR deve avere gbr = 0")
+                    }
+                    if matches!(val, 2 | 4 | 66 | 67) && (mbr_ul_mbps == 0 && mbr_dl_mbps == 0) {
+                        anyhow::bail!("5QI GBR deve avere mbr > 0")
+                    }
+                    if matches!(val, 2 | 4 | 66 | 67) && ((gbr_ul_mbps == 0 && mbr_ul_mbps > 0) || (gbr_dl_mbps == 0 && mbr_dl_mbps > 0) || (mbr_ul_mbps == 0 && mbr_dl_mbps == 0)) {
+                        anyhow::bail!("5QI GBR deve avere gbr > 0 se mbr > 0")
+                    }
+                    val
+                }
+            };
+            let (dscp_green, dscp_yellow) = map_5qi_to_dscp(five_qi)?;
             if qer_id != 0 && ((gbr_ul_mbps <= mbr_ul_mbps && gbr_dl_mbps <= mbr_dl_mbps)) {
                 if (mbr_ul_mbps > 0 || mbr_dl_mbps > 0) && burst_bytes < 1500 {
                     anyhow::bail!("burst_bytes deve essere >= 1500")
@@ -176,16 +257,16 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
                 if state.qer_state_map.lock().unwrap().get(&qer_id, 0).is_err() {
                     state.qer_state_map.lock().unwrap().insert(qer_id, zero_qer_state(state.num_cpus)?, 0)?;
                 } 
-                state.qer_map.lock().unwrap().insert(qer_id, Qer {qfi: qfi, cir_ul: make_bucket(gbr_ul_mbps, burst_bytes, state.cpu_div),
-                                                                                    pir_ul: make_bucket(mbr_ul_mbps, burst_bytes, state.cpu_div),
-                                                                                    cir_dl: make_bucket(gbr_dl_mbps, burst_bytes, state.cpu_div),
-                                                                                    pir_dl: make_bucket(mbr_dl_mbps, burst_bytes, state.cpu_div)},                                                                                    
-                                                                                    0)?;
+                state.qer_map.lock().unwrap().insert(qer_id, Qer {qfi: qfi, five_qi: five_qi, dscp_green: dscp_green, dscp_yellow: dscp_yellow, _pad: [0;4],
+                                                                            cir_ul: make_bucket(gbr_ul_mbps, burst_bytes, state.cpu_div),
+                                                                            pir_ul: make_bucket(mbr_ul_mbps, burst_bytes, state.cpu_div),
+                                                                            cir_dl: make_bucket(gbr_dl_mbps, burst_bytes, state.cpu_div),
+                                                                            pir_dl: make_bucket(mbr_dl_mbps, burst_bytes, state.cpu_div)},                                                                                    
+                                                                            0)?;
             } else {
                 anyhow::bail!("Uno o più parametri QoS errati")
             }
         }
-
         ControlCommand::DeleteUplink { teid } => {
             if state.ul_pdr_map.lock().unwrap().get(&teid, 0).is_err() {
                 anyhow::bail!("PDR NON TROVATA")
@@ -193,7 +274,6 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
                 state.ul_pdr_map.lock().unwrap().remove(&teid)?;
             }
         }
-
         ControlCommand::DeleteDownlink { ue_ip } => {
             if state.dl_pdr_map.lock().unwrap().get(&ue_ip.to_bits(), 0).is_err() {
                 anyhow::bail!("PDR NON TROVATA")
@@ -202,13 +282,10 @@ pub fn apply_command (state: &ControlState, cmd: ControlCommand) -> anyhow::Resu
             }
         }
     }
-
-
     Ok(())
 }
 
 pub async  fn run_control_plane ( socket: UdpSocket, state: ControlState ) {
-    
     if let Ok(addr) = socket.local_addr() {
         println!("[CP]: in ascolto on: {:?}", addr);
     }
@@ -292,4 +369,27 @@ fn far_action_to_u8 (action: &FarAction) -> u8 {
 
 fn zero_qer_state (num_cpus: u64) -> anyhow::Result<PerCpuValues<QerState>> {
     return Ok(PerCpuValues::try_from((0..num_cpus as usize).map(|_| QerState { tat_cir_dl: 0, tat_pir_dl: 0, tat_cir_ul: 0, tat_pir_ul: 0 }).collect::<Vec<_>>())?)
+}
+
+fn map_5qi_to_dscp (five_qi: u8) -> anyhow::Result<(u8, u8)> {
+
+    match five_qi {
+        1 | 3 | 65 | 82..=85 => {
+            Ok((DSCP_EF, DSCP_EF))
+        }
+        2 | 67 => {
+            Ok((DSCP_AF41, DSCP_AF43))
+        }
+        4 | 66 => {
+            Ok((DSCP_AF31, DSCP_AF33))
+        }
+        5 | 69 => {
+            Ok((DSCP_CS5, DSCP_CS5))
+        }
+        6 | 7 | 8 => {
+            Ok((DSCP_AF11, DSCP_AF11))
+        }
+        9 => Ok((DSCP_BE, DSCP_BE)),
+        _ => anyhow::bail!("5QI non valido")
+    }
 }

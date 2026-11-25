@@ -2,7 +2,7 @@ use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr};
 use upf_simply_common::{
-    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_AF11, DSCP_AF13, DSCP_BE, FAR_FORWARD, GtpPair, NO_QFI
+    CNT_DECAP, CNT_DROP_FAR, CNT_DROP_QOS, CNT_ERR, CNT_ERR_INNER_IPV4, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_BE, FAR_FORWARD, GtpPair, NO_QFI
 };
 use crate::{gtp::GtpInfo, maps::{FAR_MAP, IP_EVENTS, QER_MAP, QER_STATE_MAP, UL_PDR_MAP, count_qfi_ul, count_ul}, net::{EsitoPolicing::{self, Green, NonQos, Red, Yellow}, ptr_at_mut}};
 
@@ -50,10 +50,9 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
                             count_ul(CNT_DROP_QOS);
                             return Ok(XDP_DROP);
                         }
-                        Green => DSCP_AF11,
-                        Yellow => DSCP_AF13,
-                        NonQos => DSCP_BE
-                        
+                        Green(d) => d,
+                        Yellow(d) => d,
+                        NonQos(d) => d,                        
                     };
                     mark_dscp_checksum_ipv4hdr(inner_ip_pkt, dscp);
 
@@ -79,25 +78,25 @@ pub fn handle(ctx: &XdpContext, eth_hdr_copy: EthHdr, gtp: GtpInfo) -> Result<u3
 fn police_ul(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
     if qer_id == 0 {
         count_ul(CNT_NON_QOS);
-        return NonQos;
+        return NonQos(DSCP_BE);
     }
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count_ul(CNT_NO_QER);
-            return NonQos
+            return NonQos(DSCP_BE)
         }
         Some(qer) => {
             if qer.pir_ul.ns_per_byte == 0 {
                 count_ul(CNT_NON_QOS);
-                return NonQos
+                return NonQos(qer.dscp_green)
             }
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count_ul(CNT_NO_QER);
-                    return NonQos }
+                    return NonQos(DSCP_BE) }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
-                        return NonQos;
+                        return NonQos(DSCP_BE);
                     }
                     let now = unsafe {bpf_ktime_get_ns() };
                     let cost_ip_pkt_p = (ip_tot_length as u64 * qer.pir_ul.ns_per_byte) >> 30; // calcolo costo di picco
@@ -121,13 +120,13 @@ fn police_ul(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
                     else if new_tat_cir - now > qer.cir_ul.burst_tolerance_ns {
                         // superamento del CIR, ma non del PIR
                         unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir; }                        
-                        return Yellow
+                        return Yellow(qer.dscp_yellow)
                     } 
                     // Condizione VERDE
                     else {
                         unsafe { (*ptr_qer).tat_pir_ul = new_tat_pir; }
                         unsafe { (*ptr_qer).tat_cir_ul = new_tat_cir; }
-                        return Green
+                        return Green(qer.dscp_green)
                     }                    
                 }
             }

@@ -1,7 +1,7 @@
 use aya_ebpf::{bindings::xdp_action::{XDP_DROP, XDP_PASS}, helpers::generated::{bpf_ktime_get_ns, bpf_xdp_adjust_head}, programs::XdpContext};
 use aya_log_ebpf::info;
 use network_types::{eth::EthHdr, ip::Ipv4Hdr, udp::UdpHdr};
-use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_AF11, DSCP_AF13, DSCP_BE, FAR_FORWARD, Far};
+use upf_simply_common::{CNT_DROP_FAR, CNT_DROP_QOS, CNT_ENCAP, CNT_ERR, CNT_FORWARD, CNT_NO_FAR, CNT_NO_PDR, CNT_NO_QER, CNT_NO_QFI, CNT_NON_QOS, DSCP_BE, FAR_FORWARD, Far};
 use crate::{gtp::GtpV1Hdr, maps::{DL_PDR_MAP, FAR_MAP, QER_MAP, QER_STATE_MAP, count_dl, count_qfi_dl}, net::{EsitoPolicing::{self, Green, NonQos, Red, Yellow}, Ipv4Info, ptr_at_mut}};
 
 
@@ -36,9 +36,9 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
                                 count_dl(CNT_DROP_QOS);
                                 return Ok(XDP_DROP)
                             }
-                            Green => DSCP_AF11,
-                            Yellow => DSCP_AF13,
-                            NonQos => DSCP_BE,
+                            Green(d) => d,
+                            Yellow(d) => d,
+                            NonQos(d) => d,
                         };
                         if far.outer_hdr_creation == 1 {
                             return encap_dl (ctx, ip.total_length, far, eth_hdr, qfi, dscp)
@@ -61,26 +61,26 @@ pub fn handle(ctx: &XdpContext, eth_hdr: EthHdr, ip: Ipv4Info) -> Result<u32, u3
 fn police_dl(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
     if qer_id == 0 {
         count_dl(CNT_NON_QOS);
-        return NonQos
+        return NonQos(DSCP_BE)
     }
     match unsafe { QER_MAP.get(&qer_id)} {
         None => {
             count_dl(CNT_NO_QER);
-            return NonQos;
+            return NonQos(DSCP_BE)
         }
         Some(qer) => {
             if qer.pir_dl.ns_per_byte == 0 {
                 count_dl(CNT_NON_QOS);
-                return NonQos
+                return NonQos(qer.dscp_green)
             }
             match QER_STATE_MAP.get_ptr_mut(&qer_id) {
                 None => { 
                     count_dl(CNT_NO_QER);
-                    return NonQos
+                    return NonQos(DSCP_BE)
                 }
                 Some(ptr_qer) => {
                     if ptr_qer.is_null() {
-                        return NonQos;
+                        return NonQos(DSCP_BE)
                     }
                     
                     let now = unsafe {bpf_ktime_get_ns() };
@@ -104,13 +104,13 @@ fn police_dl(qer_id: u32, ip_tot_length: u16) -> EsitoPolicing {
                     // Condizione GIALLO
                     else if new_tat_cir - now > qer.cir_dl.burst_tolerance_ns {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
-                        return Yellow;
+                        return Yellow(qer.dscp_yellow);
                     }
                     // Condizione VERDE
                     else {
                         unsafe { (*ptr_qer).tat_pir_dl = new_tat_pir; }
                         unsafe { (*ptr_qer).tat_cir_dl = new_tat_cir; }
-                        return Green;
+                        return Green(qer.dscp_green);
                     }
                 }
             }
