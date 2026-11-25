@@ -258,9 +258,9 @@ Quando si eseguono i test Uplink e Downlink contemporaneamente, i pacchetti UDP 
 Per evitarlo, avviare un semplice sink UDP in background dentro `ns-dn` prima di lanciare le suite in parallelo:
 
 ```
-sudo ip netns exec ns-dn nc -ul 5000 >/dev/null &
+sudo ip netns exec ns-dn python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.bind(('0.0.0.0',5000)); [s.recvfrom(2048) for _ in iter(int,1)]" &
 ```
-Al termine dei test è possibile terminarlo con `sudo pkill -f "nc -ul 5000"`.
+Al termine dei test è possibile terminarlo con `sudo pkill -f "recvfrom(2048)"`.
 
 **Control Plane Dinamico Live & Multi-Classe 5QI** (sull'host):
 
